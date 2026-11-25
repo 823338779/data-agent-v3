@@ -1,0 +1,22 @@
+/* 首页沿用系统字体，让状态入口在桌面和移动端都容易访问。 */
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color: #193932;
+  background: #f6f8f6;
+}
+
+main {
+  max-width: 48rem;
+  margin: 12vh auto;
+  padding: 0 1.5rem;
+}
+
+h1 {
+  margin: 0 0 1.5rem;
+  font-size: clamp(2rem, 6vw, 3.5rem);
+}
+
+a {
+  color: #175c50;
+  text-underline-offset: 0.25em;
+}
