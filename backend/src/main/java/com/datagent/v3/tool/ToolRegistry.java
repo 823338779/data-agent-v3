@@ -1,0 +1,69 @@
+package com.datagent.v3.tool;
+
+import java.util.*;
+import java.util.function.Supplier;
+import com.datagent.v3.agent.AgentDefinition;
+import com.datagent.v3.model.Message;
+import com.datagent.v3.model.Message.ToolCall;
+import org.springframework.stereotype.Component;
+import tools.jackson.databind.ObjectMapper;
+
+@Component
+public class ToolRegistry {
+    private static final String FUNCTION = "function";
+    private static final String NAME = "name";
+    private static final String PARAMETERS = "parameters";
+    private static final String ERROR = "error";
+    /** 所有已注册工具，按模型调用名索引。 */
+    private final Map<String, AgentTool> tools = new HashMap<>();
+    /** 负责解析参数与序列化工具结果。 */
+    private final ObjectMapper json;
+
+    public ToolRegistry(List<AgentTool> implementations, AgentDefinition agent, ObjectMapper json) {
+        this.json = json;
+        for (var tool : implementations) {
+            if (tools.putIfAbsent(tool.name(), tool) != null) {
+                throw new IllegalArgumentException("工具名重复：" + tool.name());
+            }
+        }
+        if (!tools.keySet().containsAll(agent.tools())) {
+            throw new IllegalArgumentException("Agent 引用了未注册工具");
+        }
+    }
+
+    public List<Map<String, Object>> visibleTools(AgentDefinition agent) {
+        return agent.tools().stream().map(tools::get).map(tool -> Map.<String, Object>of(AgentTool.TYPE, FUNCTION,
+                FUNCTION, Map.of(NAME, tool.name(), AgentTool.DESCRIPTION, tool.description(), PARAMETERS, tool.schema()))).toList();
+    }
+
+    public Message invoke(AgentDefinition agent, ToolCall call, Runnable onStart) {
+        // 校验可见范围、字段数量与类型，再由工具校验字段语义。
+        AgentTool tool = tools.get(call.name());
+        if (tool == null || !agent.tools().contains(call.name())) {
+            return error(call, "工具未开放");
+        }
+        Supplier<Map<String, String>> operation;
+        try {
+            var args = json.readTree(call.arguments());
+            var fields = tool.parameters().keySet();
+            if (!args.isObject() || !args.propertyNames().equals(fields)
+                    || fields.stream().anyMatch(field -> !args.get(field).isString())) {
+                return error(call, "工具参数与定义不符");
+            }
+            operation = tool.prepare(args);
+        } catch (RuntimeException invalid) {
+            return error(call, "无效的工具参数，请检查格式和取值");
+        }
+        // 执行错误作为带原调用 ID 的结果交还模型。
+        onStart.run();
+        try {
+            return Message.result(call, json.writeValueAsString(operation.get()), true);
+        } catch (RuntimeException failure) {
+            return error(call, "工具执行失败");
+        }
+    }
+
+    private Message error(ToolCall call, String reason) {
+        return Message.result(call, json.writeValueAsString(Map.of(ERROR, reason)), false);
+    }
+}

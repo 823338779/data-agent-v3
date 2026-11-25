@@ -18,6 +18,18 @@
 
 ## 1. Agent 定义
 
+### 与 Datus 实现的对应关系
+
+| Datus 参考入口 | V3 落点 |
+|---|---|
+| `AgentSpec`、配置节点的工具范围检查 | `AgentDefinition` 声明允许列表，`ToolRegistry` 用同一份定义生成模型描述，并在执行前重新检查权限与参数。 |
+| `AgenticNode.execute_stream`、`StreamRunContext` | `AgentRunner` 维护每次执行独有的文本缓冲和事件序号。模型适配器每次只处理一条响应，Runner 关联调用与结果。 |
+| `ActionHistory`、`action_sse_converter`、`ChatTaskManager` | `RunEvent` 表达执行动作，`RunStreamService` 负责 SSE 传输。生产事件与网络写入各自在独立任务执行，浏览器断线后可从完整消息恢复页面。 |
+
+上述对应描述的是工程职责。V3 的会话与恢复由 PostgreSQL 事务及 MyBatis-Plus 实现。
+
+### 默认 Agent
+
 首版在后端代码中注册一个标识为 `general` 的 Agent，包括系统指令、模型配置引用和允许调用的工具名。系统指令要求模型按需用工具，并在工具不可用时如实说明。工具注册表由本地实现构建，启动时检查重名以及 Agent 引用了不存在的工具这两类配置错误。
 
 模型连接地址、模型名与凭据通过后端配置注入。首版建议对接一个支持流式文本和函数工具调用的 OpenAI Chat Completions 兼容端点。适配器只向 Runner 提供文本增量、单次响应结束原因、完整工具调用及错误。实现者可在现有 HTTP 客户端与兼容 SDK 之间选择，须关闭 SDK 自动执行工具的能力。
@@ -43,7 +55,7 @@
 
 ## 4. 会话与上下文
 
-通过 MyBatis-Plus 将三类记录写入 PostgreSQL。以下为建议表名。
+通过 MyBatis-Plus 的 `IService` 和 Lambda Wrapper 将三类记录写入 PostgreSQL。会话占用使用带空值条件的原子更新。表结构与字段注释由 V3 的 PostgreSQL DDL 维护，业务读写无需 Mapper XML。
 
 | 表 | 每行含义 | 保存内容 |
 |---|---|---|
