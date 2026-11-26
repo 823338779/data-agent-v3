@@ -11,15 +11,16 @@
     </parent>
 
     <groupId>com.datagent</groupId>
-    <artifactId>data-agent-v3</artifactId>
+    <artifactId>data-agent</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <properties>
         <java.version>21</java.version>
+        <!-- reactor 启动时跳过聚合工程和库，仅 app 执行启动目标。 -->
+        <spring-boot.run.skip>true</spring-boot.run.skip>
     </properties>
 
-    <!-- 从 V3 根目录构建后端模块。 -->
     <modules>
         <module>backend</module>
     </modules>

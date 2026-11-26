@@ -290,13 +290,13 @@ export function Chat() {
     <main>
       <header><button className="panel-toggle" aria-controls="sessions" aria-expanded={sidebar}
         aria-label={sidebar ? '收起会话侧栏' : '展开会话侧栏'} onClick={() => setSidebar(!sidebar)}>
-        <span aria-hidden="true" className="panel-icon" /></button><span>Data Agent V3</span></header>
+        <span aria-hidden="true" className="panel-icon" /></button><span>Data Agent</span></header>
       <section className="conversation" aria-label="对话记录" ref={conversation} onScroll={event => {
         const panel = event.currentTarget
         follow.current = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 64
       }}>
         <div className="thread">
-          <div className="welcome">欢迎使用 Data Agent V3</div>
+          <div className="welcome">欢迎使用 Data Agent</div>
           {!history.length && !busy && !error && <div className="examples">{EXAMPLES.map(example =>
             <button key={example} onClick={() => { editDraft(example); input.current?.focus() }}>{example}</button>)}</div>}
           {history.map(turn => <Transcript key={turn.id} turn={turn} />)}
