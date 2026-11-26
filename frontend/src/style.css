@@ -1,34 +1,95 @@
-/* 单列对话区保留稳定的阅读宽度，输入区始终可达。 */
+/* 共享色板对应 Datus 的紫色操作、白色消息和浅灰画布。 */
 :root {
-  font-family: Inter, "Microsoft YaHei UI", system-ui, sans-serif;
-  color: #183a34;
-  background: #f6f8f5;
-  font-synthesis: none;
+  font: 15px/1.5 Inter, "Microsoft YaHei UI", system-ui, sans-serif;
+  color-scheme: light;
+  --canvas: #fafafa; --surface: #fff; --soft: #f6f6f8; --line: #dedee4;
+  --ink: #262630; --muted: #696975; --purple: #5b4bea; --action: #5b4bea;
+  --bubble: #e5e2f4; --error: #a42c38; --glow: #eeedfb; --shadow: #3027580b;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #1b1b21; --surface: #24242c; --soft: #2e2e38; --line: #42424c;
+  --ink: #eeeef4; --muted: #b1b1bf; --purple: #b3aaff; --action: #5847d5;
+  --bubble: #403b57; --error: #ffadb5; --glow: #282536; --shadow: #0002;
 }
 * { box-sizing: border-box; }
-body { margin: 0; }
-.workspace { width: min(100%, 54rem); margin: auto; height: 100dvh; padding: 0 1.5rem 1.25rem; display: grid; grid-template-rows: auto 1fr auto; }
-header { display: flex; justify-content: space-between; align-items: center; padding: 1.25rem 0; border-bottom: 1px solid #cdd9d2; }
-.brand { font-weight: 700; letter-spacing: -.04em; font-size: 1.3rem; }
-header a { font-size: .82rem; color: #356459; text-underline-offset: .2rem; }
-.conversation { overflow-y: auto; min-height: 0; padding: 1rem .25rem 1.5rem; }
-.intro { margin: clamp(2rem, 15vh, 9rem) 0 2rem; }
-h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.3rem); letter-spacing: -.05em; }
-.intro p, .status { color: #4c675e; }
-.turn { display: grid; gap: .8rem; margin: 1rem 0 2rem; }
-.question, .answer p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
-.question { justify-self: end; max-width: 86%; padding: .65rem 1rem; background: #e0ece2; border-radius: 1rem 1rem .25rem 1rem; }
-.answer p { margin: 0; }
-.tool { width: fit-content; max-width: 100%; margin: .5rem 0; padding: .45rem .7rem; background: #fbfcfa; border: 1px solid #cfdbd3; border-radius: .5rem; }
-.tool summary { cursor: pointer; font-size: .9rem; }
-.tool small { margin-left: 1rem; color: #507069; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; font: .85rem/1.5 ui-monospace, monospace; }
-.error { color: #942e1f; }
-form { background: white; border: 1px solid #b6cabe; border-radius: .85rem; padding: .8rem; display: grid; gap: .4rem; grid-template-columns: 1fr auto; align-items: end; }
-form:focus-within { outline: 2px solid #598575; }
-label { grid-column: 1 / -1; color: #47685d; font-size: .8rem; }
-textarea { width: 100%; min-width: 0; resize: vertical; max-height: 22vh; background: transparent; border: 0; padding: .1rem; color: inherit; font: inherit; }
-textarea:focus { outline: none; }
-button { cursor: pointer; font: inherit; font-weight: 600; color: white; background: #205b49; border: 0; border-radius: .55rem; padding: .6rem 1rem; }
-button:disabled { background: #e1e8e2; color: #52675a; cursor: default; }
-@media (max-width: 40rem) { .workspace { padding: 0 .85rem .8rem; } }
+body { margin: 0; color: var(--ink); background: var(--canvas); }
+button, textarea { font: inherit; color: inherit; }
+button, a { -webkit-tap-highlight-color: transparent; }
+button { cursor: pointer; border: 0; background: transparent; }
+a { color: inherit; text-decoration: none; }
+:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+[hidden] { display: none !important; }
+
+/* 侧栏保持独立滚动；收起时主区自然填满窗口。 */
+.workspace { display: flex; height: 100dvh; }
+aside { flex: 0 0 clamp(13rem, 19.3vw, 21rem); min-width: 0; padding: .85rem .6rem .5rem;
+  display: flex; flex-direction: column; background: var(--surface); border-right: 1px solid var(--line); }
+.new-chat { display: flex; gap: .45rem; align-items: center; justify-content: center;
+  background: var(--action); color: white; border-radius: .35rem; min-height: 2.45rem; font-weight: 600; }
+.new-chat:hover, .send:enabled:hover { filter: brightness(1.1); }
+nav { flex: 1; overflow: auto; padding: .8rem 0; }
+nav h2 { margin: .3rem .8rem .6rem; color: var(--muted); font-size: .75rem; font-weight: 500; }
+nav a { display: grid; gap: .15rem; padding: .55rem .8rem; border-radius: .6rem; }
+nav a:hover, nav a[aria-current], footer button:hover, .panel-toggle:hover { background: var(--soft); }
+nav a[aria-current] strong { color: var(--purple); }
+nav strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+nav time, footer, .composer-tools, .status { color: var(--muted); font-size: .8rem; }
+footer, header, .composer-tools { display: flex; align-items: center; }
+footer { padding: .6rem .4rem 0; border-top: 1px solid var(--line); justify-content: space-between; }
+footer button, footer a { padding: .25rem .4rem; border-radius: .4rem; }
+.list-error { padding: .6rem; color: var(--error); }
+.list-error button { text-decoration: underline; }
+
+/* 右侧以同一阅读宽度对齐对话和输入框。 */
+main { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+  background: radial-gradient(ellipse 75% 28% at 75% 100%, var(--glow), transparent), var(--canvas); }
+header { padding: .5rem .85rem; gap: .55rem; font-weight: 600; }
+.panel-toggle { width: 2.1rem; height: 2.1rem; display: grid; place-items: center; border-radius: .4rem; }
+.panel-icon { display: block; width: 1.1rem; height: .95rem; border: 1.5px solid currentColor; border-radius: .2rem; }
+.panel-icon::before { content: ""; display: block; height: 100%; width: 32%; border-right: 1.5px solid currentColor; }
+.conversation { min-height: 0; overflow: auto; }
+.thread, .composer { width: min(calc(100% - 2rem), 66rem, 84%); margin-inline: auto; }
+.thread { padding: .5rem 0 1.4rem; }
+.welcome, .reply, .question { width: fit-content; max-width: 100%; margin: 0; padding: .8rem 1.05rem;
+  background: var(--surface); border-radius: 1.1rem 1.1rem 1.1rem .2rem; overflow-wrap: anywhere; white-space: pre-wrap; }
+.turn { display: grid; gap: .8rem; margin-top: .9rem; }
+.question { justify-self: end; max-width: 87%; background: var(--bubble); border-radius: 1.1rem 1.1rem .2rem 1.1rem; }
+.answer { min-width: 0; display: grid; gap: .5rem; }
+.answer:empty { display: none; }
+.reply { min-width: 0; white-space: normal; }
+.reply > :first-child { margin-top: 0; }
+.reply > :last-child { margin-bottom: 0; }
+.reply p { white-space: pre-line; }
+.reply pre, .reply :not(pre) > code { background: var(--soft); border-radius: .35rem; padding: .15rem .3rem; }
+.reply pre { padding: .7rem; }
+.reply a { color: var(--purple); text-decoration: underline; }
+.examples { display: flex; gap: .55rem; flex-wrap: wrap; margin: .85rem 0; }
+.examples button { padding: .45rem .8rem; color: var(--muted); background: var(--surface); border: 1px solid var(--line); border-radius: 1rem; }
+.examples button:hover { color: var(--purple); border-color: var(--purple); }
+.error { color: var(--error); overflow-wrap: anywhere; }
+.tool { background: var(--soft); border: 1px solid var(--line); border-radius: .55rem; overflow: hidden; }
+.tool summary { padding: .55rem .8rem; cursor: pointer; }
+.tool summary span { color: var(--purple); font-weight: 600; }
+.tool small { float: right; color: var(--muted); }
+.tool dl { margin: 0; padding: .7rem .85rem; border-top: 1px solid var(--line); }
+.tool dt { font-weight: 600; font-size: .8rem; }
+.tool dd { margin: .25rem 0 .65rem; }
+.tool dd:last-child { margin-bottom: 0; }
+pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: .85rem/1.55 ui-monospace, monospace; }
+
+/* 输入框固定在对话底部，窄屏侧栏展开后仍为消息保留空间。 */
+.composer { background: var(--surface); border: 1px solid var(--line); border-radius: 1rem;
+  padding: .85rem; margin-bottom: max(.8rem, env(safe-area-inset-bottom)); box-shadow: 0 3px 15px var(--shadow); }
+.composer:focus-within { border-color: var(--purple); }
+textarea { width: 100%; display: block; border: 0; outline: 0; background: transparent; resize: none; }
+textarea::placeholder { color: var(--muted); }
+.composer-tools { justify-content: space-between; margin-top: .5rem; }
+.send { display: grid; place-items: center; width: 2rem; height: 2rem; color: white; background: var(--action); border-radius: 50%; font-size: 1.25rem; }
+.send:disabled { background: var(--soft); color: var(--muted); cursor: default; }
+@media (max-width: 44rem) {
+  .workspace { flex-direction: column; }
+  aside { flex: 0 1 auto; max-height: 40dvh; border-right: 0; border-bottom: 1px solid var(--line); }
+  nav { min-height: 0; }
+  .thread, .composer { width: calc(100% - 1.4rem); }
+}

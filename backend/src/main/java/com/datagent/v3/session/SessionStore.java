@@ -23,7 +23,7 @@ public class SessionStore {
     private static final String LATEST_TURN = "LIMIT 1";
     private static final int CHECKPOINT_FORMAT = 1;
     /** 会话与活动运行指针。 */
-    private final IService<SessionEntity> sessions;
+    private final SessionPersistence sessions;
     /** 会话中的独立运行记录。 */
     private final IService<RunEntity> runs;
     /** 保存完整的角色消息。 */
@@ -38,6 +38,18 @@ public class SessionStore {
                           List<Message> messages) {}
     /** 单个事务快照中的活动运行与全部历史。 */
     public record Snapshot(String sessionId, String activeRunId, List<RunView> runs) {}
+
+    /** 侧栏中的会话摘要。
+     * @param id 用于打开会话详情的标识
+     * @param title 首条提问的前 80 个字符
+     * @param updatedAt 会话最近一次活动时间
+     */
+    public record RecentSession(String id, String title, Instant updatedAt) {}
+
+    public List<RecentSession> recent(String agentKey) {
+        // 只加载侧栏摘要，消息正文仍通过单会话快照读取。
+        return sessions.getBaseMapper().recent(agentKey);
+    }
 
     public String createSession(String agentKey) {
         var session = new SessionEntity();

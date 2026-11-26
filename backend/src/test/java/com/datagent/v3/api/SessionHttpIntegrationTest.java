@@ -82,4 +82,23 @@ class SessionHttpIntegrationTest extends PostgresTest {
         assertThat(snapshot.at("/runs/0/messages").size()).isEqualTo(2);
         assertThat(snapshot.at("/runs/0/messages/1/content").asString()).isEqualTo("completed after disconnect");
     }
+
+    @Test void recentSessionsUseFirstQuestionAndLatestActivity() throws Exception {
+        // 先建两个有提问的会话和一个空会话，再继续较早的会话。
+        String first = session(), second = session(), empty = session();
+        when(model.complete(any(), any())).thenReturn(new ModelClient.ModelReply("OK", List.of()));
+        send(first + "/runs", "{\"message\":\"第一条提问\"}");
+        send(second + "/runs", "{\"message\":\"另一个会话\"}");
+        send(first + "/runs", "{\"message\":\"继续追问\"}");
+
+        // 列表只呈现有消息的会话；追问改变顺序，标题仍取首条提问。
+        var response = send("", null);
+        assertThat(response.statusCode()).isEqualTo(200);
+        var rows = json.readTree(response.body());
+        assertThat(rows.at("/0/id").asString()).isEqualTo(first.substring(1));
+        assertThat(rows.at("/0/title").asString()).isEqualTo("第一条提问");
+        assertThat(rows.at("/0/updatedAt").asString()).isNotBlank();
+        assertThat(rows.at("/1/id").asString()).isEqualTo(second.substring(1));
+        assertThat(response.body()).doesNotContain(empty.substring(1));
+    }
 }

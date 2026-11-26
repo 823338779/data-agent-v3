@@ -2,6 +2,7 @@ package com.datagent.v3.api;
 
 import com.datagent.v3.agent.AgentDefinition;
 import com.datagent.v3.session.SessionStore;
+import java.util.List;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.*;
@@ -25,6 +26,12 @@ public class SessionController {
 
     public record Created(String sessionId) {}
     public record Input(String message) {}
+
+    /** 按最近活动顺序展示当前 Agent 有提问记录的会话。 */
+    @GetMapping
+    public List<SessionStore.RecentSession> recent() {
+        return sessions.recent(agent.key());
+    }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)

@@ -15,6 +15,8 @@ export type Message = {
 }
 export type Run = { id: string; status: string; failure?: string; messages: Message[] }
 export type Snapshot = { sessionId: string; activeRunId: string | null; runs: Run[] }
+/** 最近会话的标识、首条提问摘要和服务端最近活动时间。 */
+export type RecentSession = { id: string; title: string; updatedAt: string }
 export type RunEvent = {
   type: string; runId: string; seq: number; messageSeq: number
   text: string | null; call: ToolCall | null; result: Message | null
@@ -29,6 +31,11 @@ async function checked(response: Response) {
 }
 
 class TemporaryServerError extends Error {}
+
+/** 侧栏读取服务端保存的最近会话，打开时再加载完整消息。 */
+export async function recentSessions(signal?: AbortSignal): Promise<RecentSession[]> {
+  return (await checked(await fetch(SESSIONS, { signal }))).json()
+}
 
 export async function createSession(): Promise<string> {
   const response = await checked(await fetch(SESSIONS, { method: 'POST' }))
