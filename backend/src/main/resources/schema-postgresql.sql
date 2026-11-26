@@ -81,3 +81,13 @@ COMMENT ON COLUMN agent_run_steer.client_message_id IS '客户端幂等 UUID';
 COMMENT ON COLUMN agent_run_steer.message IS '未经改写的用户补充';
 COMMENT ON COLUMN agent_run_steer.message_seq IS '纳入后的真实消息序号';
 COMMENT ON COLUMN agent_run_steer.received_at IS '收件时间';
+
+-- 固定用户的每个 Agent 只有一份跨会话记忆正文，无分片或条目表。
+CREATE TABLE IF NOT EXISTS agent_memory (
+    agent_key text PRIMARY KEY,
+    content text NOT NULL CHECK (octet_length(content) <= 2000),
+    revision bigint NOT NULL CHECK (revision > 0)
+);
+COMMENT ON COLUMN agent_memory.agent_key IS '由运行所属会话推导的 Agent 标识';
+COMMENT ON COLUMN agent_memory.content IS '整段长期记忆原文';
+COMMENT ON COLUMN agent_memory.revision IS '正文发生变化时递增的版本';

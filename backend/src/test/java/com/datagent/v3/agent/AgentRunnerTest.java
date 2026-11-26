@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import com.datagent.v3.session.*;
+import com.datagent.v3.memory.*;
 import com.datagent.v3.tool.*;
 import com.datagent.v3.model.*;
 import com.datagent.v3.model.ModelClient.ModelReply;
@@ -18,6 +19,130 @@ class AgentRunnerTest extends PostgresTest {
     @Autowired ToolRegistry tools;
     @Autowired ConversationContextService contexts;
     @Autowired tools.jackson.databind.ObjectMapper json;
+
+    @Autowired MemoryRequestAssembly memories;
+    @Autowired MemoryMutationService memoryMutations;
+    @Autowired org.springframework.jdbc.core.JdbcTemplate jdbc;
+
+    @Test void explicitMemoryPersistsAcrossSessionsWithoutAnotherWriteTool() {
+        jdbc.update("DELETE FROM agent_memory WHERE agent_key = ?", agent.key());
+        String first = store.createSession(agent.key());
+        var calls = new AtomicInteger();
+        List<ModelClient.ModelRequest> requests = new ArrayList<>();
+        var runner = new AgentRunner(store, tools, agent, (request, delta) -> {
+            requests.add(request);
+            if (calls.getAndIncrement() == 0) {
+                return new ModelReply("", List.of(new Message.ToolCall("save", "add_memory",
+                        "{\"content\":\"经营周报默认用万元\"}")));
+            }
+            return new ModelReply("完成", List.of());
+        }, contexts, json, memories, memoryMutations);
+        var events = new ArrayList<RunEvent>();
+        runner.execute(store.beginRun(first, "以后经营周报默认用万元"), events::add);
+        runner.execute(store.beginRun(store.createSession(agent.key()), "生成经营周报"), events::add);
+        assertThat(requests.getFirst().tools().toString()).contains("add_memory");
+        assertThat(requests.getLast().tools().toString()).doesNotContain("add_memory", "edit_memory");
+        assertThat(requests.getLast().system()).contains("经营周报默认用万元");
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM agent_memory WHERE agent_key = ?", Integer.class, agent.key()))
+                .isEqualTo(1);
+        assertThat(store.snapshot(first).runs().getFirst().messages()).filteredOn(row -> "save".equals(row.toolCallId()))
+                .singleElement().satisfies(row -> assertThat(row.success()).isTrue());
+        jdbc.update("DELETE FROM agent_memory WHERE agent_key = ?", agent.key());
+    }
+
+    @Test void crossSessionUpdateIsVisibleOnNextBusinessCallAndWritesRequireAuthorization() {
+        var key = "memory-refresh-" + UUID.randomUUID();
+        String session = store.createSession(key);
+        jdbc.update("INSERT INTO agent_memory(agent_key,content,revision) VALUES (?,?,1)", key, "周报默认用万元");
+        var calls = new AtomicInteger();
+        var events = new ArrayList<RunEvent>();
+        ModelClient model = (input, delta) -> {
+            assertThat(input.tools().toString()).doesNotContain("add_memory", "edit_memory");
+            if (calls.getAndIncrement() == 0) {
+                assertThat(input.system()).contains("周报默认用万元");
+                jdbc.update("UPDATE agent_memory SET content = ?, revision = 2 WHERE agent_key = ?", "周报默认用元", key);
+                return new ModelReply("", List.of(new Message.ToolCall("rejected", "add_memory",
+                        "{\"content\":\"周报默认用万元\"}")));
+            }
+            assertThat(input.system()).contains("周报默认用元").doesNotContain("周报默认用万元");
+            assertThat(input.messages().getLast().success()).isFalse();
+            assertThat(input.messages().getLast().content()).contains("NOT_AUTHORIZED");
+            return new ModelReply("完成", List.of());
+        };
+        try {
+            new AgentRunner(store, tools, agent, model, contexts, json, memories, memoryMutations)
+                    .execute(store.beginRun(session, "这次周报用元"), events::add);
+            assertThat(events.getLast().type()).isEqualTo(RunEvent.COMPLETED);
+            assertThat(jdbc.queryForObject("SELECT revision FROM agent_memory WHERE agent_key = ?", Long.class, key)).isEqualTo(2);
+        } finally {
+            jdbc.update("DELETE FROM agent_memory WHERE agent_key = ?", key);
+        }
+    }
+
+    @Test void committedMemoryRemainsWhenAnswerFailsAndExplicitForgetClearsBody() {
+        var key = "memory-forget-" + UUID.randomUUID();
+        String session = store.createSession(key);
+        String preference = "经营周报默认用万元";
+        var calls = new AtomicInteger();
+        var events = new ArrayList<RunEvent>();
+        ModelClient model = (input, delta) -> switch (calls.getAndIncrement()) {
+            case 0 -> new ModelReply("", List.of(new Message.ToolCall("same-id", "add_memory",
+                    json.writeValueAsString(Map.of("content", preference)))));
+            case 1 -> throw new IllegalStateException("模型断流");
+            case 2 -> new ModelReply("", List.of(new Message.ToolCall("same-id", "edit_memory",
+                    json.writeValueAsString(Map.of("old_string", preference, "new_string", "")))));
+            default -> {
+                assertThat(input.system()).contains("<memory>\n\"\"\n</memory>");
+                yield new ModelReply("已遗忘", List.of());
+            }
+        };
+        var runner = new AgentRunner(store, tools, agent, model, contexts, json, memories, memoryMutations);
+        try {
+            runner.execute(store.beginRun(session, "以后" + preference), events::add);
+            assertThat(events.getLast().type()).isEqualTo(RunEvent.FAILED);
+            assertThat(store.snapshot(session).runs().getFirst().messages()).filteredOn(row -> "same-id".equals(row.toolCallId()))
+                    .singleElement().satisfies(row -> assertThat(row.success()).isTrue());
+            assertThat(jdbc.queryForObject("SELECT content FROM agent_memory WHERE agent_key = ?", String.class, key)).isEqualTo(preference);
+            runner.execute(store.beginRun(session, "忘记「" + preference + "」"), events::add);
+            assertThat(events.getLast().type()).isEqualTo(RunEvent.COMPLETED);
+            assertThat(jdbc.queryForObject("SELECT revision FROM agent_memory WHERE agent_key = ?", Long.class, key)).isEqualTo(2);
+        } finally {
+            jdbc.update("DELETE FROM agent_memory WHERE agent_key = ?", key);
+        }
+    }
+
+    @Test void readOnceThenIgnoreExcludesTheReadResultFromModelButKeepsOriginalHistory() {
+        var key = "memory-read-" + UUID.randomUUID();
+        String session = store.createSession(key);
+        String run = store.beginRun(session, "你记住了什么？");
+        var sentinel = "读取曾经的偏好原文";
+        jdbc.update("INSERT INTO agent_memory(agent_key,content,revision) VALUES (?,?,1)", key, sentinel);
+        var calls = new AtomicInteger();
+        var events = new ArrayList<RunEvent>();
+        ModelClient model = (input, delta) -> {
+            if (calls.getAndIncrement() == 0) {
+                assertThat(input.tools().toString()).contains("readMemory").doesNotContain("add_memory", "edit_memory");
+                store.acceptSteer(session, run, UUID.randomUUID(), "这次忽略记忆");
+                return new ModelReply("", List.of(new Message.ToolCall("read", "readMemory", "{}")));
+            }
+            assertThat(input.tools().toString()).doesNotContain("readMemory", "add_memory", "edit_memory");
+            assertThat(input.system()).doesNotContain(sentinel);
+            assertThat(input.messages()).extracting(Message::content).noneMatch(text -> text.contains(sentinel));
+            return new ModelReply("本轮忽略记忆", List.of());
+        };
+        try {
+            new AgentRunner(store, tools, agent, model, contexts, json, memories, memoryMutations).execute(run, events::add);
+            assertThat(events.getLast().type()).isEqualTo(RunEvent.COMPLETED);
+            assertThat(store.snapshot(session).runs().getFirst().messages()).filteredOn(row -> "read".equals(row.toolCallId()))
+                    .singleElement().satisfies(row -> {
+                        assertThat(row.content()).contains(sentinel);
+                        assertThat(row.success()).isTrue();
+                    });
+            assertThat(jdbc.queryForObject("SELECT content FROM agent_memory WHERE agent_key = ?", String.class, key)).isEqualTo(sentinel);
+        } finally {
+            jdbc.update("DELETE FROM agent_memory WHERE agent_key = ?", key);
+        }
+    }
 
     @Test void multipleCallsAndSelfCorrectionKeepOriginalIds() {
         var step = new AtomicInteger();
@@ -33,7 +158,7 @@ class AgentRunnerTest extends PostgresTest {
             };
         };
         var session = store.createSession(agent.key());
-        var runner = new AgentRunner(store, tools, agent, model, contexts, json);
+        var runner = new AgentRunner(store, tools, agent, model, contexts, json, memories, memoryMutations);
         var events = new ArrayList<RunEvent>();
         runner.execute(store.beginRun(session, "东京"), events::add);
         assertThat(inputs.get(1)).extracting(Message::toolCallId).containsSequence("1", "2");
@@ -63,7 +188,7 @@ class AgentRunnerTest extends PostgresTest {
                     .anyMatch(text -> text.contains("会话历史摘要") && text.contains("已支付"));
             return new ModelReply("按地区查询已支付订单", List.of());
         };
-        var runner = new AgentRunner(store, tools, agent, model, smallWindow, json);
+        var runner = new AgentRunner(store, tools, agent, model, smallWindow, json, memories, memoryMutations);
         var events = new ArrayList<RunEvent>();
         runner.execute(store.beginRun(session, "按地区拆分"), events::add);
         assertThat(events.getLast().type()).isEqualTo("run.completed");
@@ -83,8 +208,10 @@ class AgentRunnerTest extends PostgresTest {
         var original = "把查询结果按地区展示";
         ModelClient model = (request, delta) -> {
             if (request.tools().isEmpty()) {
-                summaryNo.incrementAndGet();
-                assertThat(request.messages().getFirst().content()).contains("inRun", "large-1");
+                // 记忆的固定提示词占用预算，可能需要折叠两批；仍逐批核对真实来源。
+                int summary = summaryNo.incrementAndGet();
+                assertThat(request.messages().getFirst().content()).contains("inRun", "large-" + summary)
+                        .doesNotContain("### Current memory");
                 return new ModelReply("已完成前面的时间查询，继续使用结果", List.of());
             }
             return switch (callNo.incrementAndGet()) {
@@ -99,7 +226,7 @@ class AgentRunnerTest extends PostgresTest {
             };
         };
         var events = new ArrayList<RunEvent>();
-        new AgentRunner(store, tools, agent, model, smallWindow, json)
+        new AgentRunner(store, tools, agent, model, smallWindow, json, memories, memoryMutations)
                 .execute(store.beginRun(session, original), events::add);
         assertThat(events.getLast().type()).isEqualTo("run.completed");
         assertThat(events.stream().filter(e -> "tool.started".equals(e.type()))).hasSize(2);
@@ -126,7 +253,7 @@ class AgentRunnerTest extends PostgresTest {
             return new ModelReply("已回查", List.of());
         };
         var events = new ArrayList<RunEvent>();
-        new AgentRunner(store, tools, agent, model, contexts, json)
+        new AgentRunner(store, tools, agent, model, contexts, json, memories, memoryMutations)
                 .execute(store.beginRun(session, "读回原文"), events::add);
         assertThat(events.getLast().type()).isEqualTo("run.completed");
     }
@@ -145,7 +272,7 @@ class AgentRunnerTest extends PostgresTest {
             assertThat(request.messages()).extracting(Message::content).endsWith("[本轮补充] 补一", "[本轮补充] 补二");
             return new ModelReply("完成", List.of());
         };
-        new AgentRunner(store, tools, agent, fake, contexts, json).execute(run, event -> {
+        new AgentRunner(store, tools, agent, fake, contexts, json, memories, memoryMutations).execute(run, event -> {
             events.add(event);
             // 第一个工具已经开始，第二个还没完成；测试其间补充不得伪装成批内消息。
             if (RunEvent.TOOL_STARTED.equals(event.type()) && "a".equals(event.call().id())) {
@@ -178,7 +305,7 @@ class AgentRunnerTest extends PostgresTest {
             throw new IllegalStateException("模型不可用");
         };
         var events = new ArrayList<RunEvent>();
-        new AgentRunner(store, tools, agent, failure, contexts, json).execute(run, events::add);
+        new AgentRunner(store, tools, agent, failure, contexts, json, memories, memoryMutations).execute(run, events::add);
         assertThat(events.getLast().type()).isEqualTo(RunEvent.FAILED);
         var failed = store.snapshot(session).runs().getLast();
         assertThat(failed.messages()).extracting(Message::content).containsExactly("首问", "已显示回答", "补充原文");
@@ -193,7 +320,7 @@ class AgentRunnerTest extends PostgresTest {
         var session = store.createSession(agent.key());
         var count = new AtomicInteger();
         var runner = new AgentRunner(store, tools, agent, (request, delta) ->
-                new ModelReply("", List.of(new Message.ToolCall("t" + count.incrementAndGet(), "current_time", "{}"))), contexts, json);
+                new ModelReply("", List.of(new Message.ToolCall("t" + count.incrementAndGet(), "current_time", "{}"))), contexts, json, memories, memoryMutations);
         var events = new ArrayList<RunEvent>();
         runner.execute(store.beginRun(session, "loop"), events::add);
         assertThat(count.get()).isEqualTo(8);
@@ -209,12 +336,12 @@ class AgentRunnerTest extends PostgresTest {
         var runner = new AgentRunner(store, tools, agent, (request, delta) -> {
             delta.accept("未完成");
             throw new IllegalStateException("连接中断");
-        }, contexts, json);
+        }, contexts, json, memories, memoryMutations);
         var events = new ArrayList<RunEvent>();
         runner.execute(store.beginRun(session, "hi"), events::add);
         assertThat(events.getLast().type()).isEqualTo("run.failed");
         assertThat(store.snapshot(session).runs().getLast().messages().getLast().content()).isEqualTo("未完成");
-        new AgentRunner(store, tools, agent, (request, delta) -> new ModelReply(" ", List.of()), contexts, json)
+        new AgentRunner(store, tools, agent, (request, delta) -> new ModelReply(" ", List.of()), contexts, json, memories, memoryMutations)
                 .execute(store.beginRun(session, "empty"), events::add);
         assertThat(store.snapshot(session).runs().getLast().status()).isEqualTo("FAILED");
     }

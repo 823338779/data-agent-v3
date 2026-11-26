@@ -192,6 +192,49 @@ public class SessionStore {
         return run;
     }
 
+    public record MemoryRunGuard(String agentKey, boolean active, boolean pending) {}
+
+    public String memoryOwner(String runId) {
+        var run = runs.getById(runId);
+        if (run == null) throw new IllegalStateException("运行不存在");
+        return requireSession(run.getSessionId()).getAgentKey();
+    }
+
+    /** 与补充收件共用行锁，必须在记忆工具事务中调用。 */
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.MANDATORY)
+    public MemoryRunGuard lockMemoryRun(String runId) {
+        var run = lockRun(runId);
+        if (run == null) throw new IllegalStateException("运行不存在");
+        var owner = requireSession(run.getSessionId()).getAgentKey();
+        var pending = steers.lambdaQuery().eq(SteerEntity::getRunId, runId)
+                .isNull(SteerEntity::getMessageSeq).exists();
+        return new MemoryRunGuard(owner, RUNNING.equals(run.getStatus()), pending);
+    }
+
+    /** 从助手的真实调用序号定位回执；不得将另一次模型请求的同名 ID 当成重放。 */
+    public Message recordedToolResult(String runId, int assistantSeq, Message.ToolCall call) {
+        var assistant = messageAt(runId, assistantSeq);
+        if (assistant == null || !Message.ASSISTANT.equals(assistant.role())) {
+            throw new IllegalStateException("找不到工具调用的助手消息");
+        }
+        int index = assistant.calls().indexOf(call);
+        if (index < 0) throw new IllegalStateException("工具调用与落库原文不符");
+        var result = messageAt(runId, assistantSeq + index + 1);
+        if (result == null) return null;
+        if (!Message.TOOL.equals(result.role()) || !call.id().equals(result.toolCallId())) {
+            throw new IllegalStateException("工具结果与调用顺序不符");
+        }
+        return result;
+    }
+
+    public Message memorySource(String runId, int seq) {
+        var message = messageAt(runId, seq);
+        if (message == null || !Message.USER.equals(message.role())) {
+            throw new IllegalStateException("找不到原始用户授权");
+        }
+        return message;
+    }
+
     private static String closedReason(RunEntity run) {
         return RUNNING.equals(run.getStatus()) ? run.getSteerCloseReason() : TERMINAL;
     }

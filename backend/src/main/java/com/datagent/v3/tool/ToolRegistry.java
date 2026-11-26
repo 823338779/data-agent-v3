@@ -36,8 +36,16 @@ public class ToolRegistry {
     }
 
     public List<Map<String, Object>> visibleTools(AgentDefinition agent, AgentTool scoped) {
+        return visibleScopedTools(agent, scoped == null ? List.of() : List.of(scoped));
+    }
+
+    public List<Map<String, Object>> visibleScopedTools(AgentDefinition agent, List<AgentTool> scoped) {
         var available = new ArrayList<>(agent.tools().stream().map(tools::get).toList());
-        if (scoped != null) available.add(scoped);
+        var names = new HashSet<>(agent.tools());
+        for (var tool : scoped) {
+            if (!names.add(tool.name())) throw new IllegalArgumentException("工具名重复：" + tool.name());
+            available.add(tool);
+        }
         return available.stream().map(tool -> Map.<String, Object>of(AgentTool.TYPE, FUNCTION,
                 FUNCTION, Map.of(NAME, tool.name(), AgentTool.DESCRIPTION, tool.description(), PARAMETERS, tool.schema()))).toList();
     }
@@ -47,9 +55,13 @@ public class ToolRegistry {
     }
 
     public Message invoke(AgentDefinition agent, ToolCall call, AgentTool scoped, Runnable onStart) {
+        return invokeScoped(agent, call, scoped == null ? List.of() : List.of(scoped), onStart);
+    }
+
+    public Message invokeScoped(AgentDefinition agent, ToolCall call, List<AgentTool> scoped, Runnable onStart) {
         // 运行内能力由服务端绑定；普通工具仍按 Agent 可见范围校验。
-        AgentTool tool = scoped != null && scoped.name().equals(call.name()) ? scoped
-                : agent.tools().contains(call.name()) ? tools.get(call.name()) : null;
+        AgentTool tool = scoped.stream().filter(t -> t.name().equals(call.name())).findFirst()
+                .orElseGet(() -> agent.tools().contains(call.name()) ? tools.get(call.name()) : null);
         if (tool == null) {
             return error(call, "工具未开放");
         }

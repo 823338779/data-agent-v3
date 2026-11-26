@@ -3,6 +3,9 @@ package com.datagent.v3.agent;
 import java.util.*;
 import java.util.function.Consumer;
 import com.datagent.v3.model.*;
+import com.datagent.v3.memory.MemoryRequestAssembly;
+import com.datagent.v3.memory.MemoryMutationService;
+import com.datagent.v3.tool.AgentTool;
 import com.datagent.v3.session.SessionStore;
 import com.datagent.v3.tool.ToolRegistry;
 import com.datagent.v3.tool.ConversationRecallTool;
@@ -16,6 +19,7 @@ import org.springframework.stereotype.Service;
 public class AgentRunner {
     private static final Logger LOG = LoggerFactory.getLogger(AgentRunner.class);
     private static final String FAILED_LOG = "Agent run failed: {}";
+    private static final String INSTRUCTION_SEPARATOR = "\n\n";
     private static final int MAX_REQUESTS = 8;
     /** 保存活动运行及完整消息。 */
     private final SessionStore sessions;
@@ -29,15 +33,22 @@ public class AgentRunner {
     private final ConversationContextService contexts;
     /** 为本轮创建只读消息回查工具。 */
     private final ObjectMapper json;
+    /** 按每次模型请求加载的记忆视图与事务执行入口。 */
+    private final MemoryRequestAssembly memories;
+    private final MemoryMutationService memoryMutations;
 
     public void execute(String runId, Consumer<RunEvent> emit) {
         var turn = new Turn(runId, emit);
         turn.send(RunEvent.STARTED, null, null, null, null, true, null);
         try {
             // 每次请求都重新校验容量；数据库中的原始聊天不受压缩影响。
-            var context = contexts.start(sessions.context(runId));
+            var initial = sessions.context(runId);
+            var context = contexts.start(initial);
             var recall = new ConversationRecallTool(sessions, runId, json);
-            var available = tools.visibleTools(agent, recall);
+            var owner = sessions.memoryOwner(runId);
+            var originals = new ArrayList<MemoryRequestAssembly.UserInput>();
+            originals.add(new MemoryRequestAssembly.UserInput(0, initial.user().content()));
+            boolean memoryWritten = false, memoryRead = false;
             for (int requestNo = 1; requestNo <= MAX_REQUESTS; requestNo++) {
                 // 只有业务请求会消费补充；最后一次取件和关闭入口一起提交。
                 var drain = sessions.drainSteers(runId, requestNo == MAX_REQUESTS);
@@ -47,11 +58,18 @@ public class AgentRunner {
                 for (var receipt : drain.incorporated()) {
                     turn.messageSeq = receipt.messageSeq();
                     context.appendUser(turn.messageSeq, Message.user(receipt.message()));
+                    originals.add(new MemoryRequestAssembly.UserInput(turn.messageSeq, receipt.message()));
                     turn.send(RunEvent.STEER_INCORPORATED, receipt.message(), null, null,
                             receipt.clientMessageId(), null, null);
                     turn.messageSeq++;
                 }
-                var input = contexts.prepare(context, model, agent, available);
+                var requestMemory = memories.prepare(owner, originals, memoryWritten, memoryRead, requestNo == MAX_REQUESTS);
+                var scoped = new ArrayList<AgentTool>();
+                scoped.add(recall);
+                scoped.addAll(requestMemory.tools());
+                var available = tools.visibleScopedTools(agent, scoped);
+                var input = contexts.prepare(context, model, agent,
+                        agent.instructions() + INSTRUCTION_SEPARATOR + requestMemory.instructions(), available, requestMemory.ignored());
                 var reply = model.complete(input, turn::delta);
                 var assistant = Message.assistant(reply.text(), reply.calls());
                 if (reply.calls().isEmpty()) {
@@ -73,14 +91,32 @@ public class AgentRunner {
                 }
                 if (requestNo == MAX_REQUESTS) throw new IllegalStateException("已达到模型调用轮数上限");
 
+                if (reply.calls().stream().map(Message.ToolCall::id).distinct().count() != reply.calls().size()) {
+                    throw new IllegalStateException("模型在同一响应中重复使用工具调用 ID");
+                }
                 // 助手一次返回的全部调用先入库，每个工具结果沿用原始调用 ID。
                 turn.messageSeq = sessions.append(runId, assistant);
                 var batch = new ArrayList<Message>();
                 batch.add(assistant);
                 turn.partial.setLength(0);
                 for (var call : reply.calls()) {
-                    var result = tools.invoke(agent, call, recall, () -> turn.send(RunEvent.TOOL_STARTED, null, call, null));
-                    sessions.append(runId, result);
+                    Message result;
+                    if (MemoryMutationService.isWrite(call.name())) {
+                        turn.send(RunEvent.TOOL_STARTED, null, call, null);
+                        // 专用事务负责保存工具回执；此处不能重复追加。
+                        var receipt = memoryMutations.execute(runId, turn.messageSeq, call, requestMemory, memoryWritten);
+                        memoryWritten |= receipt.spentWrite();
+                        result = receipt.result();
+                    } else if (MemoryMutationService.isRead(call.name())) {
+                        turn.send(RunEvent.TOOL_STARTED, null, call, null);
+                        result = memoryMutations.read(owner, call, requestMemory.canRead() && !memoryRead);
+                        memoryRead |= Boolean.TRUE.equals(result.success());
+                        sessions.append(runId, result);
+                    } else {
+                        result = tools.invokeScoped(agent, call, scoped,
+                                () -> turn.send(RunEvent.TOOL_STARTED, null, call, null));
+                        sessions.append(runId, result);
+                    }
                     batch.add(result);
                     turn.send(RunEvent.TOOL_FINISHED, null, call, result);
                 }
