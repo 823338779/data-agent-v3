@@ -1,13 +1,17 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
-import { createSession, recentSessions, runAndRestore, restoreSession } from './chat-api'
-import type { Message, RecentSession, Run, RunEvent, Snapshot } from './chat-api'
+import { createSession, recentSessions, runAndRestore, restoreSession, SteerRejection, submitSteer } from './chat-api'
+import type { Message, RecentSession, Run, Snapshot, SteerInput, SteerReceipt } from './chat-api'
+import { applyRunEvent, applySteerReceipt, deriveComposerMode, deriveSteerDisplay, mergeRunSnapshot } from './steer-state'
 
 const SESSION_PARAM = 'session'
-const STARTED = 'run.started', COMPLETED = 'run.completed', FAILED = 'run.failed'
-const DELTA = 'text.delta', TOOL_STARTED = 'tool.started', TOOL_FINISHED = 'tool.finished'
-const RUNNING = 'RUNNING', SUCCEEDED = 'SUCCEEDED', FAILURE = 'FAILED'
-const USER = 'user', ASSISTANT = 'assistant', TOOL = 'tool'
+const STARTED = 'run.started', INCORPORATED = 'run.steer_incorporated'
+const RUNNING = 'RUNNING'
+const USER = 'user', TOOL = 'tool'
+const STEER_STORAGE = 'data-agent-v3.steer:'
+const STEER_CONFIRMING = '正在确认补充'
+const SEND = '发送', STEER = '补充本轮'
+type PendingSteer = SteerInput & { runId: string }
 const labels: Record<string, string> = { current_time: '查询当前时间', convert_timezone: '换算时区' }
 const MOBILE = '(max-width: 44rem)'
 const DARK = 'dark', LIGHT = 'light', THEME_KEY = 'data-agent-v3.theme'
@@ -24,28 +28,21 @@ function chatUrl(id?: string) {
   return url.toString()
 }
 
-function applyEvent(history: Run[], event: RunEvent, question: string): Run[] {
-  // SSE 与快照共用消息结构，最终消息覆盖同位置的流式文本。
-  if (event.type === STARTED) return [...history, { id: event.runId, status: RUNNING,
-    messages: [{ role: USER, content: question, calls: [] }] }]
-  return history.map(turn => {
-    if (turn.id !== event.runId) return turn
-    if (event.type === FAILED) return { ...turn, status: FAILURE, failure: event.text ?? undefined }
-    const messages = [...turn.messages]
-    const index = event.messageSeq
-    const assistant = messages[index] ?? { role: ASSISTANT, content: '', calls: [] }
-    if (event.type === DELTA || event.type === COMPLETED) {
-      messages[index] = { ...assistant, content: (event.type === DELTA ? assistant.content : '') + (event.text ?? '') }
-    }
-    if ((event.type === TOOL_STARTED || event.type === TOOL_FINISHED) && event.call) {
-      const call = event.call
-      if (!assistant.calls.some(old => old.id === call.id)) {
-        messages[index] = { ...assistant, calls: [...assistant.calls, call] }
-      }
-      if (event.result) messages.push(event.result)
-    }
-    return { ...turn, messages, status: event.type === COMPLETED ? SUCCEEDED : turn.status }
-  })
+function loadPending(sessionId: string): PendingSteer | null {
+  try {
+    const raw = sessionStorage.getItem(STEER_STORAGE + sessionId)
+    if (!raw) return null
+    const pending = JSON.parse(raw)
+    return typeof pending?.runId === 'string' && typeof pending.clientMessageId === 'string'
+      && typeof pending.message === 'string' ? pending : null
+  } catch { return null }
+}
+
+function savePending(sessionId: string, pending: PendingSteer | null) {
+  try {
+    if (pending) sessionStorage.setItem(STEER_STORAGE + sessionId, JSON.stringify(pending))
+    else sessionStorage.removeItem(STEER_STORAGE + sessionId)
+  } catch { /* 存储受限时，本页内仍保留重试标识。 */ }
 }
 
 // 已结束的轮次保持引用稳定，新文本到达时仅解析当前轮的 Markdown。
@@ -73,6 +70,11 @@ const Transcript = memo(function Transcript({ turn }: { turn: Run }) {
         </details>
       })}
     </div>
+  })}{turn.steers?.filter(receipt => deriveSteerDisplay(receipt, turn.status) !== 'message').map(receipt => {
+    const waiting = deriveSteerDisplay(receipt, turn.status) === 'waiting'
+    return <div className="steer-receipt" key={receipt.clientMessageId}>
+      <span>{receipt.message}</span><small>{waiting ? '等待纳入' : '未使用'}</small>
+    </div>
   })}{turn.failure && <p className="error" role="alert">{turn.failure}</p>}</article>
 })
 
@@ -81,6 +83,10 @@ export function Chat() {
   const [history, setHistory] = useState<Run[]>([])
   const [busy, setBusy] = useState(true)
   const [question, setQuestion] = useState('')
+  const [pending, setPending] = useState<PendingSteer | null>(null)
+  const [steerSending, setSteerSending] = useState(false)
+  const [steerError, setSteerError] = useState('')
+  const [rejectedDraft, setRejectedDraft] = useState('')
   const [error, setError] = useState('')
   const [recent, setRecent] = useState<RecentSession[]>([])
   const [listError, setListError] = useState('')
@@ -93,6 +99,66 @@ export function Chat() {
   const conversation = useRef<HTMLElement>(null)
   const follow = useRef(true)
   const sending = useRef(false)
+  const requestInFlight = useRef(false)
+  const pendingRef = useRef<PendingSteer | null>(null)
+  const pendingDraftRevision = useRef(-1)
+  const draftRevision = useRef(0)
+  const sessionRef = useRef('')
+  const lifecycle = useRef<AbortController | null>(null)
+  const active = history.find(run => run.status === RUNNING)
+  const mode = deriveComposerMode(active?.id ?? null, active, busy, Boolean(pending))
+
+  function editDraft(text: string) {
+    draftRevision.current++
+    setQuestion(text)
+  }
+
+  function updatePending(id: string, value: PendingSteer | null) {
+    if (id !== sessionRef.current) return
+    pendingRef.current = value
+    setPending(value)
+    savePending(id, value)
+  }
+
+  function confirmSteer(id: string, receipt: SteerReceipt) {
+    if (id !== sessionRef.current) return
+    setHistory(previous => applySteerReceipt(previous, receipt))
+    const waiting = pendingRef.current
+    if (waiting?.runId !== receipt.runId || waiting.clientMessageId !== receipt.clientMessageId) return
+    updatePending(id, null)
+    setSteerError('')
+    if (draftRevision.current === pendingDraftRevision.current) setQuestion('')
+  }
+
+  async function transmitSteer(id: string, sendingSteer: PendingSteer) {
+    if (id !== sessionRef.current || requestInFlight.current) return
+    requestInFlight.current = true
+    setSteerSending(true)
+    setSteerError('')
+    const signal = lifecycle.current?.signal
+    try {
+      const { runId, clientMessageId, message } = sendingSteer
+      confirmSteer(id, await submitSteer(id, runId, { clientMessageId, message }, signal))
+    } catch (cause) {
+      if (signal?.aborted || id !== sessionRef.current || pendingRef.current !== sendingSteer) return
+      if (cause instanceof SteerRejection) {
+        updatePending(id, null)
+        setSteerError(cause.message)
+        if (cause.code === 'STEER_CLOSED') {
+          setHistory(previous => previous.map(turn => turn.id === sendingSteer.runId
+            ? { ...turn, canSteer: false, steerCloseReason: cause.reason } : turn))
+        }
+        // 不覆盖等待回执时新增的草稿，拒绝的旧文本仍可手动找回。
+        setQuestion(current => current || sendingSteer.message)
+        setRejectedDraft(sendingSteer.message)
+      } else {
+        setSteerError('连接中断，本次补充尚未确认。')
+      }
+    } finally {
+      requestInFlight.current = false
+      if (!signal?.aborted && id === sessionRef.current) setSteerSending(false)
+    }
+  }
 
   useEffect(() => {
     // 主题仅影响本机界面，禁用浏览器存储时仍然允许临时切换。
@@ -113,13 +179,21 @@ export function Chat() {
   }, [revision])
 
   function receive(state: Snapshot) {
-    setHistory(state.runs)
+    if (state.sessionId !== sessionRef.current) return
+    setHistory(previous => mergeRunSnapshot(previous, state.runs))
+    const waiting = pendingRef.current
+    if (waiting) {
+      const receipt = state.runs.find(run => run.id === waiting.runId)?.steers
+        ?.find(row => row.clientMessageId === waiting.clientMessageId)
+      if (receipt) confirmSteer(state.sessionId, receipt)
+    }
     setError('')
   }
 
   useEffect(() => {
     let alive = true
     const controller = new AbortController()
+    lifecycle.current = controller
     async function load() {
       try {
         const url = new URL(location.href)
@@ -127,7 +201,10 @@ export function Chat() {
         if (!alive) return
         url.searchParams.set(SESSION_PARAM, id)
         window.history.replaceState(null, '', url)
+        sessionRef.current = id
         setSession(id)
+        const unconfirmed = loadPending(id)
+        if (unconfirmed) updatePending(id, unconfirmed)
         await restoreSession(id, receive, setError, controller.signal)
       } catch (cause) {
         if (alive) {
@@ -139,7 +216,7 @@ export function Chat() {
       }
     }
     void load()
-    return () => { alive = false; controller.abort() }
+    return () => { alive = false; sessionRef.current = ''; controller.abort() }
   }, [])
 
   useEffect(() => {
@@ -149,28 +226,49 @@ export function Chat() {
   }, [history, busy])
 
   async function send() {
+    if (!question.trim() || !session || mode === 'disabled') return
+    const id = session
+    if (mode === 'steer' && active) {
+      // 每次点击冻结目标 Run 与原文，重试复用该 UUID，不会改成下一轮。
+      if (pendingRef.current || requestInFlight.current) return
+      const steer = { runId: active.id, clientMessageId: crypto.randomUUID(), message: question }
+      pendingDraftRevision.current = draftRevision.current
+      updatePending(id, steer)
+      setRejectedDraft('')
+      await transmitSteer(id, steer)
+      return
+    }
+    if (sending.current) return
     const text = question.trim()
-    if (!text || !session || busy || sending.current) return
+    const revisionAtSend = draftRevision.current
+    const signal = lifecycle.current?.signal
     sending.current = true
     follow.current = true
     setBusy(true)
     setError('')
     let accepted = false
     try {
-      await runAndRestore(session, text, event => {
+      await runAndRestore(id, text, event => {
+        if (signal?.aborted || id !== sessionRef.current) return
         if (event.type === STARTED) {
           accepted = true
-          setQuestion('')
+          if (draftRevision.current === revisionAtSend) setQuestion('')
           setRevision(value => value + 1)
         }
-        setHistory(previous => applyEvent(previous, event, text))
-      }, receive, setError)
+        setHistory(previous => applyRunEvent(previous, event, text))
+        if (event.type === INCORPORATED && event.clientMessageId) {
+          confirmSteer(id, { runId: event.runId, clientMessageId: event.clientMessageId,
+            message: event.text ?? '', messageSeq: event.messageSeq, runStatus: RUNNING })
+        }
+      }, receive, setError, signal)
     } catch (cause) {
-      if (!accepted) setError(cause instanceof Error ? cause.message : '连接中断，请核对会话记录。')
+      if (!accepted && !signal?.aborted) setError(cause instanceof Error ? cause.message : '连接中断，请核对会话记录。')
     } finally {
       sending.current = false
-      setBusy(false)
-      setRevision(value => value + 1)
+      if (!signal?.aborted && id === sessionRef.current) {
+        setBusy(false)
+        setRevision(value => value + 1)
+      }
     }
   }
 
@@ -200,7 +298,7 @@ export function Chat() {
         <div className="thread">
           <div className="welcome">欢迎使用 Data Agent V3</div>
           {!history.length && !busy && !error && <div className="examples">{EXAMPLES.map(example =>
-            <button key={example} onClick={() => { setQuestion(example); input.current?.focus() }}>{example}</button>)}</div>}
+            <button key={example} onClick={() => { editDraft(example); input.current?.focus() }}>{example}</button>)}</div>}
           {history.map(turn => <Transcript key={turn.id} turn={turn} />)}
           {busy && <p className="status" role="status">{session ? '正在处理…' : '正在打开会话…'}</p>}
           {error && <p className="error" role="alert">{error}</p>}
@@ -208,14 +306,25 @@ export function Chat() {
       </section>
     <form className="composer" onSubmit={event => { event.preventDefault(); void send() }}>
       <textarea id="question" ref={input} aria-label="消息" rows={2} value={question} placeholder="输入问题或继续追问…"
-        onChange={event => setQuestion(event.target.value)} onKeyDown={event => {
+        onChange={event => editDraft(event.target.value)} onKeyDown={event => {
           if (event.key === ENTER && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault(); void send()
           }
         }} />
-      <div className="composer-tools"><span>Shift + Enter 换行</span>
-        <button className="send" aria-label="发送消息" title="发送消息" disabled={!session || busy || !question.trim()}>
-          <span aria-hidden="true">↑</span></button></div>
+      {pending && <div className="steer-status" role="status">{STEER_CONFIRMING}
+        {!steerSending && <button type="button" onClick={() => void transmitSteer(session, pending)}>重试确认</button>}
+      </div>}
+      {steerError && <div className="steer-status error" role="alert">{steerError}
+        {rejectedDraft && question !== rejectedDraft && <button type="button" onClick={() => {
+          editDraft(question ? question + '\n' + rejectedDraft : rejectedDraft)
+          setRejectedDraft('')
+        }}>找回补充草稿</button>}
+      </div>}
+      <div className="composer-tools"><span>{active?.steerCloseReason === 'LIMIT'
+        ? '本轮已开始最后一次模型请求' : 'Shift + Enter 换行'}</span>
+        <button className={mode === 'steer' ? 'send steer-send' : 'send'} aria-label={active ? STEER : SEND}
+          title={active ? STEER : SEND} disabled={!session || mode === 'disabled' || !question.trim()}>
+          {active ? STEER : <span aria-hidden="true">↑</span>}</button></div>
     </form>
     </main>
   </div>

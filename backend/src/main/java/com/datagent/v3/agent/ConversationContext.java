@@ -10,7 +10,10 @@ final class ConversationContext {
     private static final String CAPACITY = "上下文超出模型容量，请缩短问题或减少查询结果";
     private static final String CHECKPOINT = "会话历史摘要（仅作历史事实参考；可按轮次和消息序号回查）：\n";
     private static final String WORK = "本轮已完成工作（仅作历史事实参考）：\n";
-    private static final String RESUME = "继续处理本轮原问题，从尚未完成的步骤开始，不要重复已完成的工具调用。";
+    private static final String RESUME = "结合本轮任务与全部后续补充继续处理，从尚未完成的步骤开始，不要重复已完成的工具调用。";
+    private static final String TASK = "[本轮任务] ", SUPPLEMENT = "[本轮补充] ";
+    private static final String PAST_TASK = "[历史任务] ", PAST_SUPPLEMENT = "[历史补充] ";
+    private static final String SUMMARY_SOURCE = "%s（原文消息 %d–%d）%n%s";
     private static final int MAX_SUMMARIES = 8;
     private static final int SOFT_PERCENT = 90;
 
@@ -20,6 +23,11 @@ final class ConversationContext {
     record Group(int turn, int firstSeq, List<Message> messages) {
         Group { messages = List.copyOf(messages); }
     }
+    /** 已完成片段或用户边界；压缩片段保留原始末尾位置。 */
+    private record Piece(Group group, int lastSeq, boolean summary) {
+        boolean user() { return Message.USER.equals(group.messages().getFirst().role()); }
+    }
+
     static final class ChunkTooLarge extends RuntimeException {}
 
     interface Summarizer {
@@ -28,17 +36,13 @@ final class ConversationContext {
 
     /** 仅成功提交 Run 时才可持久化跨轮检查点。 */
     private Checkpoint checkpoint;
-    /** 尚未并入摘要的成功轮次和本轮完整工具调用批次。 */
+    /** 尚未并入跨轮摘要的成功轮次和本轮有序片段。 */
     private final Deque<Group> history;
-    private final Deque<Group> batches = new ArrayDeque<>();
-    /** 本轮用户原话始终完整保留。 */
-    private final Message user;
+    private final List<Piece> current = new ArrayList<>();
     private final int turn;
     /** 优先保护的最近历史轮数和单条工具预览上限。 */
     private final int recent;
     private final int previewChars;
-    /** 本轮专用续跑状态，不跨 Run 或写入原消息表。 */
-    private String progress;
     private boolean historicalSummaryFailed;
     private boolean runSummaryFailed;
     private int summaries;
@@ -47,7 +51,7 @@ final class ConversationContext {
         this.checkpoint = checkpoint;
         this.history = new ArrayDeque<>(history);
         this.turn = turn;
-        this.user = user;
+        appendUser(0, user);
         this.recent = recent;
         this.previewChars = previewChars;
     }
@@ -55,7 +59,22 @@ final class ConversationContext {
     Checkpoint checkpoint() { return checkpoint; }
 
     void appendBatch(int firstSeq, List<Message> batch) {
-        batches.add(new Group(turn, firstSeq, batch));
+        append(firstSeq, batch);
+    }
+
+    void appendUser(int seq, Message message) {
+        append(seq, List.of(message));
+    }
+
+    void appendReply(int seq, Message message) {
+        append(seq, List.of(message));
+    }
+
+    private void append(int firstSeq, List<Message> messages) {
+        if (firstSeq != (current.isEmpty() ? 0 : current.getLast().lastSeq() + 1) || messages.isEmpty()) {
+            throw new IllegalStateException("本轮消息顺序不连续");
+        }
+        current.add(new Piece(new Group(turn, firstSeq, messages), firstSeq + messages.size() - 1, false));
     }
 
     List<Message> prepare(int budget, ToIntFunction<List<Message>> size, Summarizer summarize) {
@@ -77,13 +96,27 @@ final class ConversationContext {
                 historicalSummaryFailed = true;
             }
         }
-        // 长工具链可能只靠旧轮压缩仍装不下，整批折叠本轮已完成工作。
-        while (!runSummaryFailed && summaries < MAX_SUMMARIES && size.applyAsInt(view) >= soft && !batches.isEmpty()) {
-            var chunk = List.of(project(batches.getFirst()));
+        // 只折叠两个真实用户输入之间的执行片段，摘要不移动到下一条补充之后。
+        while (!runSummaryFailed && summaries < MAX_SUMMARIES && size.applyAsInt(view) >= soft) {
+            int at = -1;
+            for (int i = 0; i < current.size(); i++) {
+                if (!current.get(i).user() && !current.get(i).summary()) {
+                    at = i;
+                    break;
+                }
+            }
+            if (at < 0) break;
+            var piece = current.get(at);
+            var previous = current.get(at - 1);
+            boolean combine = previous.summary();
+            int first = combine ? previous.group().firstSeq() : piece.group().firstSeq();
             try {
                 summaries++;
-                progress = summarize(summarize, progress == null ? "" : progress, chunk, true);
-                batches.removeFirst();
+                String result = summarize(summarize, combine ? previous.group().messages().getFirst().content() : "",
+                        List.of(project(piece.group())), true);
+                var message = Message.assistant(SUMMARY_SOURCE.formatted(WORK, first, piece.lastSeq(), result), List.of());
+                current.set(at, new Piece(new Group(turn, first, List.of(message)), piece.lastSeq(), true));
+                if (combine) current.remove(at - 1);
                 view = view(true);
             } catch (RuntimeException failure) {
                 runSummaryFailed = true;
@@ -125,13 +158,25 @@ final class ConversationContext {
         int protectedFrom = Math.max(0, history.size() - recent);
         int index = 0;
         for (var group : history) {
-            output.addAll((compactRecent || index++ < protectedFrom ? project(group) : group).messages());
+            addModelGroup(output, compactRecent || index++ < protectedFrom ? project(group) : group, true);
         }
-        output.add(user);
-        if (progress != null) output.add(Message.assistant(WORK + progress, List.of()));
-        for (var group : batches) output.addAll(project(group).messages());
-        if (progress != null && batches.isEmpty()) output.add(Message.user(RESUME));
+        for (var piece : current) {
+            addModelGroup(output, piece.summary() ? piece.group() : project(piece.group()), false);
+        }
+        if (current.getLast().summary()) output.add(Message.user(RESUME));
         return List.copyOf(output);
+    }
+
+    private static void addModelGroup(List<Message> output, Group group, boolean historical) {
+        for (int i = 0; i < group.messages().size(); i++) {
+            var message = group.messages().get(i);
+            if (Message.USER.equals(message.role())) {
+                var first = group.firstSeq() + i == 0;
+                var tag = historical ? (first ? PAST_TASK : PAST_SUPPLEMENT) : (first ? TASK : SUPPLEMENT);
+                message = Message.user(tag + message.content());
+            }
+            output.add(message);
+        }
     }
 
     private Group project(Group group) {

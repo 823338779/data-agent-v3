@@ -43,7 +43,7 @@ class AgentRunnerTest extends PostgresTest {
                 "tool.finished", "tool.started", "tool.finished", "text.delta", "run.completed");
         assertThat(events.getLast().messageSeq()).isEqualTo(6);
         runner.execute(store.beginRun(session, "刚才"), events::add);
-        assertThat(inputs.getLast()).extracting(Message::content).contains("东京 10 点", "刚才");
+        assertThat(inputs.getLast()).extracting(Message::content).contains("东京 10 点", "[本轮任务] 刚才");
     }
 
     @Test void longConversationCompactsAndNextRunReadsPersistedCheckpoint() {
@@ -91,7 +91,7 @@ class AgentRunnerTest extends PostgresTest {
                 case 1, 2 -> new ModelReply("", List.of(new Message.ToolCall("large-" + callNo.get(),
                         "current_time", "{}" + " ".repeat(2450))));
                 default -> {
-                    assertThat(request.messages()).extracting(Message::content).contains(original)
+                    assertThat(request.messages()).extracting(Message::content).contains("[本轮任务] " + original)
                             .anyMatch(text -> text.contains("本轮已完成工作"));
                     assertThat(request.messages()).extracting(Message::toolCallId).doesNotContain("large-1");
                     yield new ModelReply("处理完成", List.of());
@@ -131,6 +131,64 @@ class AgentRunnerTest extends PostgresTest {
         assertThat(events.getLast().type()).isEqualTo("run.completed");
     }
 
+    @Test void steersOnlyBetweenCompleteToolBatches() {
+        var session = store.createSession(agent.key());
+        var run = store.beginRun(session, "首问");
+        var calls = new AtomicInteger();
+        var events = new ArrayList<RunEvent>();
+        var first = new Message.ToolCall("a", "current_time", "{}");
+        var second = new Message.ToolCall("b", "current_time", "{}");
+        ModelClient fake = (request, onText) -> {
+            if (calls.incrementAndGet() == 1) return new ModelReply("", List.of(first, second));
+            assertThat(request.messages()).extracting(Message::role).containsExactly("user", "assistant", "tool", "tool", "user", "user");
+            assertThat(request.messages().subList(2, 4)).extracting(Message::toolCallId).containsExactly("a", "b");
+            assertThat(request.messages()).extracting(Message::content).endsWith("[本轮补充] 补一", "[本轮补充] 补二");
+            return new ModelReply("完成", List.of());
+        };
+        new AgentRunner(store, tools, agent, fake, contexts, json).execute(run, event -> {
+            events.add(event);
+            // 第一个工具已经开始，第二个还没完成；测试其间补充不得伪装成批内消息。
+            if (RunEvent.TOOL_STARTED.equals(event.type()) && "a".equals(event.call().id())) {
+                store.acceptSteer(session, run, UUID.randomUUID(), "补一");
+                store.acceptSteer(session, run, UUID.randomUUID(), "补二");
+            }
+        });
+        assertThat(events.stream().filter(e -> RunEvent.TOOL_STARTED.equals(e.type())))
+                .extracting(e -> e.call().id()).containsExactly("a", "b");
+        assertThat(events.getLast().type()).isEqualTo(RunEvent.COMPLETED);
+        var transcript = store.snapshot(session).runs().getFirst();
+        assertThat(transcript.steers()).extracting(SessionStore.SteerReceipt::messageSeq).containsExactly(4, 5);
+    }
+
+    @Test void failsAfterCommittedReplyWithoutDuplicatingPartialOrCheckpoint() {
+        var session = store.createSession(agent.key());
+        var old = store.beginRun(session, "旧口径");
+        store.finish(old, Message.assistant("旧回答", List.of()));
+        var saved = store.beginRun(session, "已总结");
+        var checkpoint = new SessionStore.Checkpoint(1, "已确认旧口径");
+        store.finishWithContext(saved, Message.assistant("已保存", List.of()), checkpoint);
+        var run = store.beginRun(session, "首问");
+        var calls = new AtomicInteger();
+        ModelClient failure = (request, onText) -> {
+            if (calls.incrementAndGet() == 1) {
+                onText.accept("已显示回答");
+                store.acceptSteer(session, run, UUID.randomUUID(), "补充原文");
+                return new ModelReply("已显示回答", List.of());
+            }
+            throw new IllegalStateException("模型不可用");
+        };
+        var events = new ArrayList<RunEvent>();
+        new AgentRunner(store, tools, agent, failure, contexts, json).execute(run, events::add);
+        assertThat(events.getLast().type()).isEqualTo(RunEvent.FAILED);
+        var failed = store.snapshot(session).runs().getLast();
+        assertThat(failed.messages()).extracting(Message::content).containsExactly("首问", "已显示回答", "补充原文");
+        assertThat(failed.steers().getFirst().messageSeq()).isEqualTo(2);
+        var next = store.beginRun(session, "下一轮");
+        assertThat(store.context(next).checkpoint()).isEqualTo(checkpoint);
+        assertThat(store.context(next).history()).extracting(SessionStore.RunView::id).doesNotContain(run);
+        store.fail(next, "结束");
+    }
+
     @Test void stopsOnEighthRequest() {
         var session = store.createSession(agent.key());
         var count = new AtomicInteger();
@@ -139,6 +197,8 @@ class AgentRunnerTest extends PostgresTest {
         var events = new ArrayList<RunEvent>();
         runner.execute(store.beginRun(session, "loop"), events::add);
         assertThat(count.get()).isEqualTo(8);
+        assertThat(events).filteredOn(e -> RunEvent.STEER_GATE.equals(e.type()))
+                .singleElement().satisfies(e -> assertThat(e.steerCloseReason()).isEqualTo(SessionStore.LIMIT));
         assertThat(events.stream().filter(e -> "tool.started".equals(e.type())).count()).isEqualTo(7);
         assertThat(events.stream().filter(e -> "run.failed".equals(e.type())).count()).isEqualTo(1);
         assertThat(store.snapshot(session).activeRunId()).isNull();

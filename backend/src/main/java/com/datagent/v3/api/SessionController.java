@@ -17,6 +17,7 @@ public class SessionController {
     static final String SESSIONS = "/api/sessions";
     private static final String SESSION = "/{sessionId}";
     private static final String RUNS = SESSION + "/runs";
+    private static final String STEERS = RUNS + "/{runId}/steers";
     /** 启动会话时绑定的 Agent。 */
     private final AgentDefinition agent;
     /** 会话占用与快照服务。 */
@@ -42,6 +43,20 @@ public class SessionController {
     @GetMapping(SESSION)
     public SessionStore.Snapshot snapshot(@PathVariable UUID sessionId) {
         return sessions.snapshot(sessionId.toString());
+    }
+
+    public record SteerInput(UUID clientMessageId, String message) {}
+    public record SteerError(String code, String reason) {}
+
+    @PostMapping(STEERS)
+    public ResponseEntity<?> steer(@PathVariable UUID sessionId, @PathVariable UUID runId, @RequestBody SteerInput input) {
+        try {
+            var result = sessions.acceptSteer(sessionId.toString(), runId.toString(), input.clientMessageId(), input.message());
+            return ResponseEntity.status(result.created() ? HttpStatus.ACCEPTED : HttpStatus.OK).body(result.receipt());
+        } catch (SessionStore.SteerRejected rejected) {
+            int status = SessionStore.STEER_LIMIT.equals(rejected.getCode()) ? 422 : 409;
+            return ResponseEntity.status(status).body(new SteerError(rejected.getCode(), rejected.getReason()));
+        }
     }
 
     @PostMapping(value = RUNS, produces = MediaType.TEXT_EVENT_STREAM_VALUE)

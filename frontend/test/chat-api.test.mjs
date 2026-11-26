@@ -36,3 +36,16 @@ test('提交连接中断且首次快照失败时持续恢复，只发送一次 P
   assert.deepEqual(methods, ['POST', 'GET', 'GET', 'GET'])
   assert.deepEqual(statuses, ['RUNNING', 'SUCCEEDED'])
 })
+
+test('补充网络失败后重试仍发送原 Run 和 UUID', async context => {
+  const input = {clientMessageId: 'same-id', message: '也给我北京时间'}
+  const sent = []
+  context.mock.method(globalThis, 'fetch', async (url, options) => {
+    sent.push([url, options.method, JSON.parse(options.body)])
+    if (sent.length === 1) throw new TypeError('offline')
+    return Response.json({runId: 'old-run', ...input, runStatus: 'SUCCEEDED', messageSeq: 2})
+  })
+  await assert.rejects(chat.submitSteer('s', 'old-run', input), /offline/)
+  assert.equal((await chat.submitSteer('s', 'old-run', input)).messageSeq, 2)
+  assert.deepEqual(sent, Array(2).fill(['/api/sessions/s/runs/old-run/steers', 'POST', input]))
+})

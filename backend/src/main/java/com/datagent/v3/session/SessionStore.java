@@ -3,9 +3,11 @@ package com.datagent.v3.session;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.datagent.v3.model.Message;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
+import lombok.Getter;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
@@ -13,13 +15,17 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.databind.ObjectMapper;
 
-/** 通过三个 IService 管理一轮对话的事务、消息及读取视图。 */
+/** 管理一轮对话的事务、消息、补充收件及读取视图。 */
 @Service
 @RequiredArgsConstructor
 public class SessionStore {
     public static final String RUNNING = "RUNNING";
     public static final String SUCCEEDED = "SUCCEEDED";
     public static final String FAILED = "FAILED";
+    public static final String STEER_LIMIT = "STEER_LIMIT", STEER_CLOSED = "STEER_CLOSED", ID_REUSED = "ID_REUSED";
+    public static final String LIMIT = "LIMIT", TERMINAL = "TERMINAL";
+    private static final String LOCK_RUN = "FOR UPDATE";
+    private static final int MAX_STEER_BYTES = 2048, MAX_STEERS = 8, MAX_RUN_STEER_BYTES = 8192;
     private static final String LATEST_TURN = "LIMIT 1";
     private static final int CHECKPOINT_FORMAT = 1;
     /** 会话与活动运行指针。 */
@@ -30,12 +36,32 @@ public class SessionStore {
     private final IService<MessageEntity> messages;
     /** 模型摘要检查点，不参与聊天显示查询。 */
     private final ContextCheckpointPersistence checkpoints;
+    /** 按 Run 持久化的补充收件。 */
+    private final SteerPersistence steers;
     /** 消息 JSON 编解码器。 */
     private final ObjectMapper json;
 
     /** 一轮的显示内容，消息位置即运行内序号。 */
     public record RunView(String id, int turnNo, String status, String failure, Instant startedAt, Instant endedAt,
-                          List<Message> messages) {}
+                          List<Message> messages, boolean canSteer, String steerCloseReason, List<SteerReceipt> steers) {}
+    /** 客户端按消息序号和 Run 状态推导收件显示。 */
+    public record SteerReceipt(String runId, UUID clientMessageId, String message, String runStatus, Integer messageSeq) {}
+    public record SteerAcceptance(SteerReceipt receipt, boolean created) {}
+    public record SteerDrain(List<SteerReceipt> incorporated, boolean closedAtLimit) {}
+    public record ReplyCommit(int messageSeq, boolean terminal) {}
+
+    @Getter
+    public static final class SteerRejected extends RuntimeException {
+        /** HTTP 可稳定匹配的业务错误码和关闭原因。 */
+        private final String code;
+        private final String reason;
+
+        SteerRejected(String code, String reason) {
+            super(code);
+            this.code = code;
+            this.reason = reason;
+        }
+    }
     /** 单个事务快照中的活动运行与全部历史。 */
     public record Snapshot(String sessionId, String activeRunId, List<RunView> runs) {}
 
@@ -82,13 +108,101 @@ public class SessionStore {
         return id;
     }
 
-    public void append(String id, Message message) {
+    public int append(String id, Message message) {
         // 同一 Run 只有一个写入者，唯一约束保护消息顺序。
         var row = new MessageEntity();
         row.setRunId(id);
         row.setSeq(Math.toIntExact(messages.lambdaQuery().eq(MessageEntity::getRunId, id).count()));
         row.setPayload(json.writeValueAsString(message));
-        messages.save(row);
+        if (!messages.save(row)) throw new IllegalStateException("消息未保存");
+        return row.getSeq();
+    }
+
+    @Transactional
+    public SteerAcceptance acceptSteer(String sessionId, String runId, UUID clientMessageId, String text) {
+        if (clientMessageId == null || text == null || text.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "请输入补充消息和有效的提交 ID");
+        }
+        // 锁内先校验归属并查旧收件；关闭或配额耗尽后仍可查询同一笔提交。
+        var run = lockRun(runId);
+        if (run == null || !sessionId.equals(run.getSessionId())) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "运行不存在");
+        }
+        var received = steers.lambdaQuery().eq(SteerEntity::getRunId, runId).list();
+        var key = clientMessageId.toString();
+        for (var row : received) {
+            if (key.equals(row.getClientMessageId())) {
+                if (!text.equals(row.getMessage())) throw new SteerRejected(ID_REUSED, null);
+                return new SteerAcceptance(receipt(run, row), false);
+            }
+        }
+        var reason = closedReason(run);
+        if (reason != null) throw new SteerRejected(STEER_CLOSED, reason);
+        int bytes = utf8Bytes(text);
+        int used = received.stream().mapToInt(row -> utf8Bytes(row.getMessage())).sum();
+        if (bytes > MAX_STEER_BYTES || received.size() >= MAX_STEERS || used + bytes > MAX_RUN_STEER_BYTES) {
+            throw new SteerRejected(STEER_LIMIT, null);
+        }
+        var row = new SteerEntity();
+        row.setRunId(runId);
+        row.setClientMessageId(key);
+        row.setMessage(text);
+        if (!steers.save(row)) throw new IllegalStateException("补充未保存");
+        return new SteerAcceptance(receipt(run, row), true);
+    }
+
+    @Transactional
+    public SteerDrain drainSteers(String runId, boolean lastBusinessRequest) {
+        // 取件与最后一次请求关门共用同一行锁和提交点。
+        var run = requireRunningRun(runId);
+        var pending = steers.lambdaQuery().eq(SteerEntity::getRunId, runId)
+                .isNull(SteerEntity::getMessageSeq).orderByAsc(SteerEntity::getId).list();
+        var incorporated = new ArrayList<SteerReceipt>();
+        for (var row : pending) {
+            row.setMessageSeq(append(runId, Message.user(row.getMessage())));
+            if (!steers.updateById(row)) throw new IllegalStateException("补充序号未保存");
+            incorporated.add(receipt(run, row));
+        }
+        boolean closed = lastBusinessRequest && run.getSteerCloseReason() == null;
+        if (closed && !runs.lambdaUpdate().eq(RunEntity::getId, runId)
+                .set(RunEntity::getSteerCloseReason, LIMIT).update()) {
+            throw new IllegalStateException("补充入口未关闭");
+        }
+        return new SteerDrain(List.copyOf(incorporated), closed);
+    }
+
+    @Transactional
+    public ReplyCommit commitTextReply(String runId, Message reply, Checkpoint checkpoint) {
+        // 回答、是否续接与最终完成在同一事务内决定，禁止已收件无人消费。
+        requireRunningRun(runId);
+        int seq = append(runId, reply);
+        boolean pending = steers.lambdaQuery().eq(SteerEntity::getRunId, runId)
+                .isNull(SteerEntity::getMessageSeq).exists();
+        if (!pending) complete(runId, checkpoint);
+        return new ReplyCommit(seq, !pending);
+    }
+
+    private RunEntity lockRun(String runId) {
+        return runs.lambdaQuery().eq(RunEntity::getId, runId).last(LOCK_RUN).one();
+    }
+
+    private RunEntity requireRunningRun(String runId) {
+        var run = lockRun(runId);
+        if (run == null || !RUNNING.equals(run.getStatus())) throw new IllegalStateException("运行已结束");
+        return run;
+    }
+
+    private static String closedReason(RunEntity run) {
+        return RUNNING.equals(run.getStatus()) ? run.getSteerCloseReason() : TERMINAL;
+    }
+
+    private static SteerReceipt receipt(RunEntity run, SteerEntity row) {
+        return new SteerReceipt(run.getId(), UUID.fromString(row.getClientMessageId()), row.getMessage(),
+                run.getStatus(), row.getMessageSeq());
+    }
+
+    private static int utf8Bytes(String text) {
+        return text.getBytes(StandardCharsets.UTF_8).length;
     }
 
     /** 新一轮的模型材料和对应持久化边界。 */
@@ -108,7 +222,7 @@ public class SessionStore {
                 .lt(RunEntity::getTurnNo, current.getTurnNo()).eq(RunEntity::getStatus, SUCCEEDED)
                 .orderByAsc(RunEntity::getTurnNo).list();
         var grouped = readMessages(previous);
-        var history = previous.stream().map(run -> view(run, grouped)).toList();
+        var history = previous.stream().map(run -> view(run, grouped, List.of())).toList();
         return new ContextInput(current.getTurnNo(), messageAt(id, 0), checkpoint, history);
     }
 
@@ -136,11 +250,19 @@ public class SessionStore {
 
     @Transactional
     public void finishWithContext(String id, Message answer, Checkpoint checkpoint) {
-        if (close(id, SUCCEEDED, null)) {
-            append(id, answer);
-            if (checkpoint != null) saveCheckpoint(id, checkpoint);
-            release(id);
+        var run = lockRun(id);
+        if (run == null || !RUNNING.equals(run.getStatus())) return;
+        if (steers.lambdaQuery().eq(SteerEntity::getRunId, id).isNull(SteerEntity::getMessageSeq).exists()) {
+            throw new IllegalStateException("不能结束尚有补充待处理的运行");
         }
+        append(id, answer);
+        complete(id, checkpoint);
+    }
+
+    private void complete(String id, Checkpoint checkpoint) {
+        if (!close(id, SUCCEEDED, null)) throw new IllegalStateException("运行终态未保存");
+        if (checkpoint != null) saveCheckpoint(id, checkpoint);
+        release(id);
     }
 
     private void saveCheckpoint(String id, Checkpoint checkpoint) {
@@ -173,7 +295,8 @@ public class SessionStore {
 
     @Transactional
     public void fail(String id, String reason, String partial) {
-        if (close(id, FAILED, reason)) {
+        // 先锁定目标 Run，使失败与收件共用提交边界。
+        if (lockRun(id) != null && close(id, FAILED, reason)) {
             if (!partial.isEmpty()) {
                 append(id, Message.assistant(partial, List.of()));
             }
@@ -206,13 +329,18 @@ public class SessionStore {
         var session = requireSession(sessionId);
         var history = runs.lambdaQuery().eq(RunEntity::getSessionId, sessionId).orderByAsc(RunEntity::getTurnNo).list();
         var grouped = readMessages(history);
-        var views = history.stream().map(run -> view(run, grouped)).toList();
+        Map<String, List<SteerEntity>> receipts = history.isEmpty() ? Map.of() : steers.lambdaQuery()
+                .in(SteerEntity::getRunId, history.stream().map(RunEntity::getId).toList())
+                .orderByAsc(SteerEntity::getId).list().stream().collect(Collectors.groupingBy(SteerEntity::getRunId));
+        var views = history.stream().map(run -> view(run, grouped, receipts.getOrDefault(run.getId(), List.of()))).toList();
         return new Snapshot(sessionId, session.getActiveRunId(), views);
     }
 
-    private static RunView view(RunEntity run, Map<String, List<Message>> grouped) {
+    private static RunView view(RunEntity run, Map<String, List<Message>> grouped, List<SteerEntity> rows) {
+        var reason = closedReason(run);
         return new RunView(run.getId(), run.getTurnNo(), run.getStatus(), run.getFailure(),
-                run.getStartedAt(), run.getEndedAt(), grouped.getOrDefault(run.getId(), List.of()));
+                run.getStartedAt(), run.getEndedAt(), grouped.getOrDefault(run.getId(), List.of()),
+                reason == null, reason, rows.stream().map(row -> receipt(run, row)).toList());
     }
 
     private Map<String, List<Message>> readMessages(List<RunEntity> history) {

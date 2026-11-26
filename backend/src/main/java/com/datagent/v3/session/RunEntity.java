@@ -19,6 +19,8 @@ public class RunEntity {
     private Integer turnNo;
     /** 运行当前状态。 */
     private String status;
+    /** 仍在运行时，关闭补充入口的原因。 */
+    private String steerCloseReason;
     /** 失败或中断原因。 */
     private String failure;
     /** 运行创建时间。 */

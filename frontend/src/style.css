@@ -93,3 +93,10 @@ textarea::placeholder { color: var(--muted); }
   nav { min-height: 0; }
   .thread, .composer { width: calc(100% - 1.4rem); }
 }
+
+/* 补充收件与正式消息分别展示，避免同一文本渲染两次。 */
+.steer-receipt { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .6rem; margin: .45rem 0; }
+.steer-receipt span { white-space: pre-wrap; overflow-wrap: anywhere; }
+.steer-receipt small, .steer-status { font-size: .85rem; }
+.steer-status button { margin-inline-start: .5rem; }
+.send.steer-send { width: auto; padding-inline: .65rem; font-size: .875rem; white-space: nowrap; }

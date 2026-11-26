@@ -32,28 +32,49 @@ public class AgentRunner {
 
     public void execute(String runId, Consumer<RunEvent> emit) {
         var turn = new Turn(runId, emit);
-        turn.send(RunEvent.STARTED, null, null, null);
+        turn.send(RunEvent.STARTED, null, null, null, null, true, null);
         try {
             // 每次请求都重新校验容量；数据库中的原始聊天不受压缩影响。
             var context = contexts.start(sessions.context(runId));
             var recall = new ConversationRecallTool(sessions, runId, json);
             var available = tools.visibleTools(agent, recall);
             for (int requestNo = 1; requestNo <= MAX_REQUESTS; requestNo++) {
+                // 只有业务请求会消费补充；最后一次取件和关闭入口一起提交。
+                var drain = sessions.drainSteers(runId, requestNo == MAX_REQUESTS);
+                if (drain.closedAtLimit()) {
+                    turn.send(RunEvent.STEER_GATE, null, null, null, null, false, SessionStore.LIMIT);
+                }
+                for (var receipt : drain.incorporated()) {
+                    turn.messageSeq = receipt.messageSeq();
+                    context.appendUser(turn.messageSeq, Message.user(receipt.message()));
+                    turn.send(RunEvent.STEER_INCORPORATED, receipt.message(), null, null,
+                            receipt.clientMessageId(), null, null);
+                    turn.messageSeq++;
+                }
                 var input = contexts.prepare(context, model, agent, available);
                 var reply = model.complete(input, turn::delta);
                 var assistant = Message.assistant(reply.text(), reply.calls());
                 if (reply.calls().isEmpty()) {
                     if (reply.text().isBlank()) throw new IllegalStateException("模型未返回回答");
                     var checkpoint = context.checkpoint();
-                    sessions.finishWithContext(runId, assistant, checkpoint == null ? null
+                    var saved = sessions.commitTextReply(runId, assistant, checkpoint == null ? null
                             : new SessionStore.Checkpoint(checkpoint.throughTurn(), checkpoint.summary()));
-                    turn.send(RunEvent.COMPLETED, reply.text(), null, null);
-                    return;
+                    turn.messageSeq = saved.messageSeq();
+                    turn.partial.setLength(0);
+                    if (saved.terminal()) {
+                        turn.send(RunEvent.COMPLETED, reply.text(), null, null);
+                        return;
+                    }
+                    // 不撤回已交付的回答；在同一个 Run 内用补充续答。
+                    context.appendReply(saved.messageSeq(), assistant);
+                    turn.send(RunEvent.REPLY_COMMITTED, reply.text(), null, null);
+                    turn.messageSeq++;
+                    continue;
                 }
                 if (requestNo == MAX_REQUESTS) throw new IllegalStateException("已达到模型调用轮数上限");
 
                 // 助手一次返回的全部调用先入库，每个工具结果沿用原始调用 ID。
-                sessions.append(runId, assistant);
+                turn.messageSeq = sessions.append(runId, assistant);
                 var batch = new ArrayList<Message>();
                 batch.add(assistant);
                 turn.partial.setLength(0);
@@ -97,7 +118,12 @@ public class AgentRunner {
         }
 
         synchronized void send(String type, String text, Message.ToolCall call, Message result) {
-            emit.accept(new RunEvent(type, runId, ++seq, messageSeq, text, call, result));
+            send(type, text, call, result, null, null, null);
+        }
+
+        synchronized void send(String type, String text, Message.ToolCall call, Message result, UUID clientMessageId,
+                               Boolean canSteer, String reason) {
+            emit.accept(new RunEvent(type, runId, ++seq, messageSeq, text, call, result, clientMessageId, canSteer, reason));
         }
     }
 }
