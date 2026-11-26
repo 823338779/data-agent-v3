@@ -17,6 +17,7 @@ public class ChatCompletionsClient implements ModelClient {
     static final String FUNCTION = "function", NAME = "name", ARGUMENTS = "arguments", ID = "id";
     static final String CALLS = "tool_calls", CONTENT = "content", STOP = "stop";
     private static final String MODEL = "model", STREAM = "stream", TOOLS = "tools", MESSAGES = "messages";
+    private static final String MAX_TOKENS = "max_tokens";
     private static final String ROLE = "role", CALL_ID = "tool_call_id", TYPE = "type";
     private static final String AUTH_HEADER = "Authorization", BEARER = "Bearer ";
     private static final String CONTENT_TYPE = "Content-Type", JSON_TYPE = "application/json";
@@ -40,13 +41,8 @@ public class ChatCompletionsClient implements ModelClient {
 
     @Override
     public ModelReply complete(ModelRequest request, Consumer<String> onText) {
-        // 协议消息仅携带模型理解的字段，保留调用参数原文和结果关联。
-        var history = new ArrayList<Map<String, Object>>();
-        history.add(Map.of(ROLE, Message.SYSTEM, CONTENT, request.system()));
-        request.messages().forEach(message -> history.add(toWire(message)));
-        var payload = Map.of(MODEL, request.model(), STREAM, true, MESSAGES, history, TOOLS, request.tools());
         var builder = HttpRequest.newBuilder(endpoint).timeout(timeout).header(CONTENT_TYPE, JSON_TYPE)
-                .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload)));
+                .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(wireRequest(request))));
         if (!token.isBlank()) {
             builder.header(AUTH_HEADER, BEARER + token);
         }
@@ -75,6 +71,18 @@ public class ChatCompletionsClient implements ModelClient {
             }
             throw new IllegalStateException("模型连接或响应异常", error);
         }
+    }
+
+    /** 预算和 HTTP 调用共用同一协议投影。 */
+    public static Map<String, Object> wireRequest(ModelRequest request) {
+        // 协议消息仅携带模型理解的字段，保留调用参数原文和结果关联。
+        var history = new ArrayList<Map<String, Object>>();
+        history.add(Map.of(ROLE, Message.SYSTEM, CONTENT, request.system()));
+        request.messages().forEach(message -> history.add(toWire(message)));
+        var payload = new LinkedHashMap<String, Object>(Map.of(MODEL, request.model(), STREAM, true,
+                MESSAGES, history, TOOLS, request.tools()));
+        if (request.maxOutputTokens() > 0) payload.put(MAX_TOKENS, request.maxOutputTokens());
+        return payload;
     }
 
     private static Map<String, Object> toWire(Message message) {

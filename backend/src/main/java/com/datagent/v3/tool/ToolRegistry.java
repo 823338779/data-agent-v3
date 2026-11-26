@@ -32,14 +32,25 @@ public class ToolRegistry {
     }
 
     public List<Map<String, Object>> visibleTools(AgentDefinition agent) {
-        return agent.tools().stream().map(tools::get).map(tool -> Map.<String, Object>of(AgentTool.TYPE, FUNCTION,
+        return visibleTools(agent, null);
+    }
+
+    public List<Map<String, Object>> visibleTools(AgentDefinition agent, AgentTool scoped) {
+        var available = new ArrayList<>(agent.tools().stream().map(tools::get).toList());
+        if (scoped != null) available.add(scoped);
+        return available.stream().map(tool -> Map.<String, Object>of(AgentTool.TYPE, FUNCTION,
                 FUNCTION, Map.of(NAME, tool.name(), AgentTool.DESCRIPTION, tool.description(), PARAMETERS, tool.schema()))).toList();
     }
 
     public Message invoke(AgentDefinition agent, ToolCall call, Runnable onStart) {
-        // 校验可见范围、字段数量与类型，再由工具校验字段语义。
-        AgentTool tool = tools.get(call.name());
-        if (tool == null || !agent.tools().contains(call.name())) {
+        return invoke(agent, call, null, onStart);
+    }
+
+    public Message invoke(AgentDefinition agent, ToolCall call, AgentTool scoped, Runnable onStart) {
+        // 运行内能力由服务端绑定；普通工具仍按 Agent 可见范围校验。
+        AgentTool tool = scoped != null && scoped.name().equals(call.name()) ? scoped
+                : agent.tools().contains(call.name()) ? tools.get(call.name()) : null;
+        if (tool == null) {
             return error(call, "工具未开放");
         }
         Supplier<Map<String, String>> operation;

@@ -43,3 +43,18 @@ COMMENT ON COLUMN agent_message.run_id IS '所属运行';
 COMMENT ON COLUMN agent_message.id IS '供 MyBatis-Plus 使用的消息主键';
 COMMENT ON COLUMN agent_message.seq IS '运行内消息顺序';
 COMMENT ON COLUMN agent_message.payload IS '完整角色消息，包含内容、工具调用及结果';
+
+-- 压缩只更新模型视图，不替换原始聊天消息。
+CREATE TABLE IF NOT EXISTS agent_context_checkpoint (
+    session_id varchar(36) PRIMARY KEY REFERENCES agent_session(id),
+    through_turn integer NOT NULL CHECK (through_turn > 0),
+    summary text NOT NULL,
+    format_version integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (session_id, through_turn) REFERENCES agent_run(session_id, turn_no)
+);
+COMMENT ON COLUMN agent_context_checkpoint.session_id IS '所属会话';
+COMMENT ON COLUMN agent_context_checkpoint.through_turn IS '摘要覆盖的最后一个成功轮次';
+COMMENT ON COLUMN agent_context_checkpoint.summary IS '仅供模型参考的会话摘要';
+COMMENT ON COLUMN agent_context_checkpoint.format_version IS '摘要格式版本';
+COMMENT ON COLUMN agent_context_checkpoint.updated_at IS '检查点更新时间';

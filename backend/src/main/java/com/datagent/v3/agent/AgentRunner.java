@@ -5,6 +5,8 @@ import java.util.function.Consumer;
 import com.datagent.v3.model.*;
 import com.datagent.v3.session.SessionStore;
 import com.datagent.v3.tool.ToolRegistry;
+import com.datagent.v3.tool.ConversationRecallTool;
+import tools.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.*;
 import org.springframework.stereotype.Service;
@@ -23,21 +25,28 @@ public class AgentRunner {
     private final AgentDefinition agent;
     /** 单次模型请求入口。 */
     private final ModelClient model;
+    /** 按请求重建压缩视图，内部摘要独立于用户可见流。 */
+    private final ConversationContextService contexts;
+    /** 为本轮创建只读消息回查工具。 */
+    private final ObjectMapper json;
 
     public void execute(String runId, Consumer<RunEvent> emit) {
         var turn = new Turn(runId, emit);
         turn.send(RunEvent.STARTED, null, null, null);
         try {
-            // 首次从数据库装入完整历史，随后只追加本轮已保存的消息。
-            var history = new ArrayList<>(sessions.context(runId));
-            var available = tools.visibleTools(agent);
+            // 每次请求都重新校验容量；数据库中的原始聊天不受压缩影响。
+            var context = contexts.start(sessions.context(runId));
+            var recall = new ConversationRecallTool(sessions, runId, json);
+            var available = tools.visibleTools(agent, recall);
             for (int requestNo = 1; requestNo <= MAX_REQUESTS; requestNo++) {
-                var input = new ModelClient.ModelRequest(agent.model(), agent.instructions(), List.copyOf(history), available);
+                var input = contexts.prepare(context, model, agent, available);
                 var reply = model.complete(input, turn::delta);
                 var assistant = Message.assistant(reply.text(), reply.calls());
                 if (reply.calls().isEmpty()) {
                     if (reply.text().isBlank()) throw new IllegalStateException("模型未返回回答");
-                    sessions.finish(runId, assistant);
+                    var checkpoint = context.checkpoint();
+                    sessions.finishWithContext(runId, assistant, checkpoint == null ? null
+                            : new SessionStore.Checkpoint(checkpoint.throughTurn(), checkpoint.summary()));
                     turn.send(RunEvent.COMPLETED, reply.text(), null, null);
                     return;
                 }
@@ -45,15 +54,17 @@ public class AgentRunner {
 
                 // 助手一次返回的全部调用先入库，每个工具结果沿用原始调用 ID。
                 sessions.append(runId, assistant);
-                history.add(assistant);
+                var batch = new ArrayList<Message>();
+                batch.add(assistant);
                 turn.partial.setLength(0);
                 for (var call : reply.calls()) {
-                    var result = tools.invoke(agent, call, () -> turn.send(RunEvent.TOOL_STARTED, null, call, null));
+                    var result = tools.invoke(agent, call, recall, () -> turn.send(RunEvent.TOOL_STARTED, null, call, null));
                     sessions.append(runId, result);
-                    history.add(result);
+                    batch.add(result);
                     turn.send(RunEvent.TOOL_FINISHED, null, call, result);
                 }
-                turn.messageSeq += 1 + reply.calls().size();
+                context.appendBatch(turn.messageSeq, batch);
+                turn.messageSeq += batch.size();
             }
         } catch (RuntimeException error) {
             // 保留已显示的部分文本，失败轮整体从未来模型上下文排除。

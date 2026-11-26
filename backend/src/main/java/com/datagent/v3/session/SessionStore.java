@@ -21,13 +21,15 @@ public class SessionStore {
     public static final String SUCCEEDED = "SUCCEEDED";
     public static final String FAILED = "FAILED";
     private static final String LATEST_TURN = "LIMIT 1";
-    private static final String HISTORY_WINDOW = "LIMIT 10";
+    private static final int CHECKPOINT_FORMAT = 1;
     /** 会话与活动运行指针。 */
     private final IService<SessionEntity> sessions;
     /** 会话中的独立运行记录。 */
     private final IService<RunEntity> runs;
     /** 保存完整的角色消息。 */
     private final IService<MessageEntity> messages;
+    /** 模型摘要检查点，不参与聊天显示查询。 */
+    private final ContextCheckpointPersistence checkpoints;
     /** 消息 JSON 编解码器。 */
     private final ObjectMapper json;
 
@@ -77,25 +79,79 @@ public class SessionStore {
         messages.save(row);
     }
 
+    /** 新一轮的模型材料和对应持久化边界。 */
+    public record ContextInput(int turn, Message user, Checkpoint checkpoint, List<RunView> history) {}
+    /** 已成功历史的摘要。 */
+    public record Checkpoint(int throughTurn, String summary) {}
+
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-    public List<Message> context(String id) {
+    public ContextInput context(String id) {
+        // 从同一数据库快照读取检查点和成功轮次，不再按固定轮数丢历史。
         var current = runs.getById(id);
+        var saved = checkpoints.getById(current.getSessionId());
+        var checkpoint = saved != null && saved.getFormatVersion() == CHECKPOINT_FORMAT
+                ? new Checkpoint(saved.getThroughTurn(), saved.getSummary()) : null;
         var previous = runs.lambdaQuery().eq(RunEntity::getSessionId, current.getSessionId())
+                .gt(RunEntity::getTurnNo, checkpoint == null ? 0 : checkpoint.throughTurn())
                 .lt(RunEntity::getTurnNo, current.getTurnNo()).eq(RunEntity::getStatus, SUCCEEDED)
-                .orderByDesc(RunEntity::getTurnNo).last(HISTORY_WINDOW).list();
-        // 先按完整轮次截取，再恢复对话时间顺序。
-        var selected = new ArrayList<>(previous.reversed());
-        selected.add(current);
-        var grouped = readMessages(selected);
-        return selected.stream().flatMap(run -> grouped.getOrDefault(run.getId(), List.of()).stream()).toList();
+                .orderByAsc(RunEntity::getTurnNo).list();
+        var grouped = readMessages(previous);
+        var history = previous.stream().map(run -> view(run, grouped)).toList();
+        return new ContextInput(current.getTurnNo(), messageAt(id, 0), checkpoint, history);
+    }
+
+    @Transactional(readOnly = true)
+    public Message recall(String activeRunId, int turnNo, int seq) {
+        // 会话范围由当前 Run 推导，不接受模型指定 sessionId；失败轮不作模型事实来源。
+        var active = runs.getById(activeRunId);
+        if (active == null || !RUNNING.equals(active.getStatus())) return null;
+        var target = runs.lambdaQuery().eq(RunEntity::getSessionId, active.getSessionId())
+                .eq(RunEntity::getTurnNo, turnNo).one();
+        if (target == null || (!activeRunId.equals(target.getId()) && !SUCCEEDED.equals(target.getStatus()))) return null;
+        return messageAt(target.getId(), seq);
+    }
+
+    private Message messageAt(String runId, int seq) {
+        var row = messages.lambdaQuery().eq(MessageEntity::getRunId, runId)
+                .eq(MessageEntity::getSeq, seq).one();
+        return row == null ? null : json.readValue(row.getPayload(), Message.class);
     }
 
     @Transactional
     public void finish(String id, Message answer) {
+        finishWithContext(id, answer, null);
+    }
+
+    @Transactional
+    public void finishWithContext(String id, Message answer, Checkpoint checkpoint) {
         if (close(id, SUCCEEDED, null)) {
             append(id, answer);
+            if (checkpoint != null) saveCheckpoint(id, checkpoint);
             release(id);
         }
+    }
+
+    private void saveCheckpoint(String id, Checkpoint checkpoint) {
+        // 与成功终态一起提交，避免失败 Run 或旧边界覆盖有效摘要。
+        var current = runs.getById(id);
+        var saved = checkpoints.getById(current.getSessionId());
+        int through = checkpoint.throughTurn();
+        if (through >= current.getTurnNo() || through <= 0 || checkpoint.summary().isBlank()) {
+            throw new IllegalArgumentException("无效的会话摘要边界");
+        }
+        if (saved != null && saved.getThroughTurn() >= through && saved.getFormatVersion() == CHECKPOINT_FORMAT) return;
+        if (!runs.lambdaQuery().eq(RunEntity::getSessionId, current.getSessionId())
+                .eq(RunEntity::getTurnNo, through).eq(RunEntity::getStatus, SUCCEEDED).exists()) {
+            throw new IllegalArgumentException("会话摘要边界必须是成功轮次");
+        }
+        var row = new ContextCheckpointEntity();
+        row.setSessionId(current.getSessionId());
+        row.setThroughTurn(through);
+        row.setSummary(checkpoint.summary());
+        row.setFormatVersion(CHECKPOINT_FORMAT);
+        row.setUpdatedAt(Instant.now());
+        if (saved == null) checkpoints.save(row);
+        else checkpoints.updateById(row);
     }
 
     @Transactional
@@ -138,9 +194,13 @@ public class SessionStore {
         var session = requireSession(sessionId);
         var history = runs.lambdaQuery().eq(RunEntity::getSessionId, sessionId).orderByAsc(RunEntity::getTurnNo).list();
         var grouped = readMessages(history);
-        var views = history.stream().map(run -> new RunView(run.getId(), run.getTurnNo(), run.getStatus(),
-                run.getFailure(), run.getStartedAt(), run.getEndedAt(), grouped.getOrDefault(run.getId(), List.of()))).toList();
+        var views = history.stream().map(run -> view(run, grouped)).toList();
         return new Snapshot(sessionId, session.getActiveRunId(), views);
+    }
+
+    private static RunView view(RunEntity run, Map<String, List<Message>> grouped) {
+        return new RunView(run.getId(), run.getTurnNo(), run.getStatus(), run.getFailure(),
+                run.getStartedAt(), run.getEndedAt(), grouped.getOrDefault(run.getId(), List.of()));
     }
 
     private Map<String, List<Message>> readMessages(List<RunEntity> history) {

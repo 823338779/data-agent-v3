@@ -15,8 +15,8 @@ class SessionStoreIntegrationTest extends PostgresTest {
     @Autowired SessionStore store;
     @Autowired JdbcTemplate jdbc;
 
-    @Test void schemaContainsThreeBusinessTables() {
-        assertThat(jdbc.queryForObject("select count(*) from information_schema.tables where table_schema=current_schema() and table_name in ('agent_run','agent_session','agent_message')", Integer.class)).isEqualTo(3);
+    @Test void schemaContainsConversationTables() {
+        assertThat(jdbc.queryForObject("select count(*) from information_schema.tables where table_schema=current_schema() and table_name in ('agent_run','agent_session','agent_message','agent_context_checkpoint')", Integer.class)).isEqualTo(4);
     }
 
     @Test void onlyOneConcurrentSenderAcquiresSession() throws Exception {
@@ -41,6 +41,33 @@ class SessionStoreIntegrationTest extends PostgresTest {
         store.fail(runs.getFirst().id(), "finished test");
     }
 
+    @Test void checkpointNeverReplacesOriginalMessagesAndRecallIsSessionScoped() {
+        var session = store.createSession("general");
+        var previous = store.beginRun(session, "仅统计已支付订单");
+        store.finish(previous, Message.assistant("确认口径", List.of()));
+
+        var folded = store.beginRun(session, "继续");
+        store.finishWithContext(folded, Message.assistant("已继续", List.of()),
+                new SessionStore.Checkpoint(1, "已确认只统计已支付订单"));
+        var active = store.beginRun(session, "回查");
+        assertThat(store.context(active).checkpoint().throughTurn()).isEqualTo(1);
+        assertThat(store.context(active).history()).extracting(SessionStore.RunView::turnNo).containsExactly(2);
+        assertThat(store.snapshot(session).runs().getFirst().messages().getFirst().content()).isEqualTo("仅统计已支付订单");
+        assertThat(store.recall(active, 1, 0).content()).isEqualTo("仅统计已支付订单");
+
+        var other = store.createSession("general");
+        var otherRun = store.beginRun(other, "另一个会话");
+        assertThat(store.recall(otherRun, 1, 0).content()).isEqualTo("另一个会话");
+        assertThat(store.recall(otherRun, 2, 0)).isNull();
+        store.fail(otherRun, "结束验证");
+        store.recover();
+
+        var resumed = store.beginRun(session, "服务重启后继续");
+        assertThat(store.context(resumed).checkpoint().throughTurn()).isEqualTo(1);
+        assertThat(store.recall(resumed, 3, 0)).isNull();
+        store.fail(resumed, "结束验证");
+    }
+
     @Test void recoversInterruptedRunBeforeAcceptingRequests() {
         var id = store.createSession("general");
         for (int i = 0; i < 11; i++) {
@@ -55,9 +82,9 @@ class SessionStoreIntegrationTest extends PostgresTest {
         assertThat(snapshot.runs().getLast().status()).isEqualTo("FAILED");
         var next = store.beginRun(id, "next");
         var history = store.context(next);
-        assertThat(history).hasSize(21);
-        assertThat(history.getFirst().content()).isEqualTo("question 1");
-        assertThat(history.getLast().content()).isEqualTo("next");
+        assertThat(history.history()).hasSize(11);
+        assertThat(history.history().getFirst().messages().getFirst().content()).isEqualTo("question 0");
+        assertThat(history.user().content()).isEqualTo("next");
         store.fail(next, "finished test");
     }
 }

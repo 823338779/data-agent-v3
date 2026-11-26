@@ -40,3 +40,9 @@ npm --prefix frontend run build
 ```
 
 后端测试需要运行 Docker，Testcontainers 自动启动隔离的 PostgreSQL，原有 Mapper 探针继续使用 H2。后端产物为 `backend/target/data-agent-v3-backend-0.1.0-SNAPSHOT.jar`，前端静态文件输出到 `frontend/dist/`。分别部署时，将 `/actuator/health` 与 `/api/` 转发到后端，并关闭 SSE 路径的代理响应缓冲。
+
+### 长对话与上下文
+
+聊天原话、回复、工具调用和结果仍存入 PostgreSQL，SSE 和会话详情读取原记录。模型不再固定读取最近 10 轮。每次模型请求前先对较大的工具结果使用带回查位置的预览，再按预算摘要旧轮；仍有压力时，压缩本轮已经完整结束的工具批次，保留本轮用户原话并继续执行。旧轮摘要只随成功 Run 提交到 `agent_context_checkpoint`。本轮续跑摘要不持久化，服务重启不会重放中断的工具调用。
+
+`AGENT_CONTEXT_WINDOW`（默认 32768）必须按实际端点配置；`AGENT_CONTEXT_ANSWER_TOKENS`（默认 2048）和 `AGENT_CONTEXT_SUMMARY_TOKENS`（默认 768）分别限制普通回复和摘要的输出。预检用协议 JSON 的 UTF-8 字节数加固定余量做保守估算，不等同于端点的精确 token 计数。若原问题或工具调用参数本身太长，且无法安全压缩，返回明确错误。回查工具只读同会话中的成功历史或本轮消息，按轮次、消息序号与偏移分页，不重跑原工具。上下文压缩节省模型输入，不删除原始数据，也不减少数据库保留容量。
