@@ -1,14 +1,13 @@
 package com.datagent.agent;
 
+import java.time.Duration;
 import java.util.*;
 import java.util.function.Consumer;
 import com.datagent.model.*;
 import com.datagent.memory.MemoryRequestAssembly;
-import com.datagent.memory.MemoryMutationService;
-import com.datagent.tool.AgentTool;
-import com.datagent.session.SessionStore;
+import com.datagent.persistence.SessionStore;
+import com.datagent.tool.execution.ToolExecution;
 import com.datagent.tool.ToolRegistry;
-import tools.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.*;
 import org.springframework.stereotype.Service;
@@ -20,64 +19,98 @@ public class AgentRunner {
     private static final String FAILED_LOG = "Agent run failed: {}";
     private static final String INSTRUCTION_SEPARATOR = "\n\n";
     private static final int MAX_REQUESTS = 30;
+    /** 断流和空回复共用重试次数；断流按两秒、四秒退避。 */
+    private static final int MAX_RETRIES = 2;
+    private static final String RETRY_LOG = "模型请求中断，第 {} 次重试，runId={}：{}";
+    /** 仅在空回复的后续请求中提醒模型交付正文或调用工具。 */
+    private static final String EMPTY_REPLY_HINT = "上次响应没有可见回答或工具调用。请继续当前任务：需要工具时发起调用，否则直接给出正文。";
     /** 保存活动运行及完整消息。 */
     private final SessionStore sessions;
     /** 登记工具并校验权限。 */
     private final ToolRegistry tools;
+    /** 在运行事务内执行工具并保存回执。 */
+    private final ToolExecution toolExecution;
     /** 默认 Agent 的配置。 */
     private final AgentDefinition agent;
     /** 单次模型请求入口。 */
     private final ModelClient model;
     /** 按请求重建压缩视图，内部摘要独立于用户可见流。 */
     private final ConversationContextService contexts;
-    /** 为本轮创建只读消息回查工具。 */
-    private final ObjectMapper json;
-    /** 按每次模型请求加载的记忆视图与事务执行入口。 */
+    /** 为业务模型请求加载记忆快照和提示词。 */
     private final MemoryRequestAssembly memories;
-    private final MemoryMutationService memoryMutations;
 
     public void execute(String runId, Consumer<RunEvent> emit) {
-        var turn = new Turn(runId, emit);
+        Turn turn = new Turn(runId, emit);
         turn.send(RunEvent.STARTED, null, null, null, null, true, null);
         try {
             // 每次请求都重新校验容量；数据库中的原始聊天不受压缩影响。
-            var initial = sessions.context(runId);
-            var archive = new ConversationArchive(sessions, runId, json);
-            var context = contexts.start(initial, archive);
+            SessionStore.ContextInput initial = sessions.context(runId);
+            ConversationContext context = contexts.start(initial);
             // 摘要只有实际请求模型时才计数，预算预检和轻量预览均不计入。
             ModelClient summaryModel = (input, onText) -> complete(runId, true, input, onText);
-            var owner = sessions.memoryOwner(runId);
-            var originals = new ArrayList<MemoryRequestAssembly.UserInput>();
-            originals.add(new MemoryRequestAssembly.UserInput(0, initial.user().content()));
-            boolean memoryWritten = false, memoryRead = false;
+            String owner = sessions.memoryOwner(runId);
+            List<Map<String, Object>> toolDefinitions = tools.definitions();
+            int retries = 0;
+            boolean retryingEmptyReply = false;
+            Message lastSuccessfulTool = null;
+            String lastAssistantText = "";
             for (int requestNo = 1; requestNo <= MAX_REQUESTS; requestNo++) {
                 // 只有业务请求会消费补充；最后一次取件和关闭入口一起提交。
-                var drain = sessions.drainSteers(runId, requestNo == MAX_REQUESTS);
+                SessionStore.SteerDrain drain = sessions.drainSteers(runId, requestNo == MAX_REQUESTS);
                 if (drain.closedAtLimit()) {
                     turn.send(RunEvent.STEER_GATE, null, null, null, null, false, SessionStore.LIMIT);
                 }
-                for (var receipt : drain.incorporated()) {
+                for (SessionStore.SteerReceipt receipt : drain.incorporated()) {
+                    // 新补充不能复用旧任务的回执作为回答。
+                    lastSuccessfulTool = null;
+                    lastAssistantText = "";
+                    retries = 0;
+                    retryingEmptyReply = false;
                     turn.messageSeq = receipt.messageSeq();
                     context.appendUser(turn.messageSeq, Message.user(receipt.message()));
-                    originals.add(new MemoryRequestAssembly.UserInput(turn.messageSeq, receipt.message()));
                     turn.send(RunEvent.STEER_INCORPORATED, receipt.message(), null, null,
                             receipt.clientMessageId(), null, null);
                     turn.messageSeq++;
                 }
-                var requestMemory = memories.prepare(owner, originals, memoryWritten, memoryRead, requestNo == MAX_REQUESTS);
-                var scoped = new ArrayList<AgentTool>();
-                scoped.add(archive);
-                scoped.addAll(requestMemory.tools());
-                var available = tools.visibleScopedTools(agent.tools(), scoped);
-                var input = contexts.prepare(context, summaryModel, agent,
-                        agent.instructions() + INSTRUCTION_SEPARATOR + requestMemory.instructions(), available, requestMemory.ignored(), archive);
-                if (!archive.bind(input.messages())) scoped.remove(archive);
-                var reply = complete(runId, false, input, turn::delta);
-                var assistant = Message.assistant(reply.text(), reply.calls());
+                MemoryRequestAssembly.Prepared memory = memories.prepare(owner, requestNo == MAX_REQUESTS);
+                String instructions = agent.instructions();
+                if (retryingEmptyReply) instructions += INSTRUCTION_SEPARATOR + EMPTY_REPLY_HINT;
+                ModelClient.ModelRequest input = contexts.prepare(context, summaryModel, agent,
+                        instructions + INSTRUCTION_SEPARATOR + memory.instructions(), toolDefinitions);
+                ModelClient.ModelReply reply;
+                try {
+                    reply = complete(runId, false, input, turn::delta);
+                    if (reply.calls().isEmpty() && reply.text().isBlank()) {
+                        throw new ModelClient.EmptyResponse("模型未返回回答");
+                    }
+                } catch (ModelClient.InterruptedResponse failure) {
+                    // 只重试尚未交付正文的请求；已执行的工具和结果保留在当前上下文。
+                    if (!turn.partial.isEmpty() || retries >= MAX_RETRIES || requestNo == MAX_REQUESTS) throw failure;
+                    waitForRetry(runId, ++retries, failure);
+                    continue;
+                } catch (ModelClient.EmptyResponse empty) {
+                    // 已收到 response.completed，使用可见正文或当前工具链的成功摘要。
+                    String answer = turn.partial.toString();
+                    if (answer.isBlank()) answer = lastSuccessfulTool == null ? "" : tools.resultSummary(lastSuccessfulTool);
+                    if (answer.isBlank()) answer = lastAssistantText;
+                    // 没有可交付内容时只重试模型请求，已有工具调用和回执保留在上下文中。
+                    if (answer.isBlank()) {
+                        if (retries >= MAX_RETRIES || requestNo == MAX_REQUESTS) {
+                            throw new IllegalStateException("模型未返回回答", empty);
+                        }
+                        retries++;
+                        retryingEmptyReply = true;
+                        turn.partial.setLength(0);
+                        continue;
+                    }
+                    reply = new ModelClient.ModelReply(answer, List.of());
+                }
+                retries = 0;
+                retryingEmptyReply = false;
+                Message assistant = Message.assistant(reply.text(), reply.calls());
                 if (reply.calls().isEmpty()) {
-                    if (reply.text().isBlank()) throw new IllegalStateException("模型未返回回答");
-                    var checkpoint = context.checkpoint();
-                    var saved = sessions.commitTextReply(runId, assistant, checkpoint == null ? null
+                    ConversationContext.Checkpoint checkpoint = context.checkpoint();
+                    SessionStore.ReplyCommit saved = sessions.commitTextReply(runId, assistant, checkpoint == null ? null
                             : new SessionStore.Checkpoint(checkpoint.throughTurn(), checkpoint.summary()));
                     turn.messageSeq = saved.messageSeq();
                     turn.partial.setLength(0);
@@ -98,31 +131,24 @@ public class AgentRunner {
                 }
                 // 助手一次返回的全部调用先入库，每个工具结果沿用原始调用 ID。
                 turn.messageSeq = sessions.append(runId, assistant);
-                var batch = new ArrayList<Message>();
+                ArrayList<Message> batch = new ArrayList<>();
                 batch.add(assistant);
+                if (!reply.text().isBlank()) lastAssistantText = reply.text();
                 turn.partial.setLength(0);
-                for (var call : reply.calls()) {
-                    Message result;
-                    if (MemoryMutationService.isWrite(call.name())) {
-                        turn.send(RunEvent.TOOL_STARTED, null, call, null);
-                        // 专用事务负责保存工具回执；此处不能重复追加。
-                        var receipt = memoryMutations.execute(runId, turn.messageSeq, call, requestMemory, memoryWritten);
-                        memoryWritten |= receipt.spentWrite();
-                        result = receipt.result();
-                    } else if (MemoryMutationService.isRead(call.name())) {
-                        turn.send(RunEvent.TOOL_STARTED, null, call, null);
-                        result = memoryMutations.read(owner, call, requestMemory.canRead() && !memoryRead);
-                        memoryRead |= Boolean.TRUE.equals(result.success());
-                        sessions.append(runId, result);
-                    } else {
-                        result = tools.invokeScoped(agent.tools(), call, scoped,
-                                () -> turn.send(RunEvent.TOOL_STARTED, null, call, null));
-                        sessions.append(runId, result);
-                    }
+                for (Message.ToolCall call : reply.calls()) {
+                    Message result = toolExecution.invoke(runId, turn.messageSeq, call, input.messages(), memory.revision(),
+                            () -> turn.send(RunEvent.TOOL_STARTED, null, call, null));
                     batch.add(result);
+                    // 失败回执之后，旧摘要和调用前的文字都不能证明这次操作成功。
+                    if (Boolean.TRUE.equals(result.success())) {
+                        lastSuccessfulTool = result;
+                    } else {
+                        lastSuccessfulTool = null;
+                        lastAssistantText = "";
+                    }
                     turn.send(RunEvent.TOOL_FINISHED, null, call, result);
                 }
-                context.appendBatch(turn.messageSeq, batch);
+                context.appendBatch(turn.messageSeq, batch, reply.toolReasoning());
                 turn.messageSeq += batch.size();
             }
         } catch (RuntimeException error) {
@@ -132,6 +158,16 @@ public class AgentRunner {
                     ? error.getMessage() : "本轮执行失败";
             sessions.fail(runId, reason, turn.partial.toString());
             turn.send(RunEvent.FAILED, reason, null, null);
+        }
+    }
+
+    private static void waitForRetry(String runId, int retry, ModelClient.InterruptedResponse failure) {
+        LOG.warn(RETRY_LOG, retry, runId, failure.getMessage());
+        try {
+            Thread.sleep(Duration.ofSeconds(2L * retry));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("等待重试时运行被中断", interrupted);
         }
     }
 

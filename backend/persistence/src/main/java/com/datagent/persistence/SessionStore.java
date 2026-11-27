@@ -1,4 +1,4 @@
-package com.datagent.session;
+package com.datagent.persistence;
 
 import com.datagent.model.Message;
 import java.time.Instant;
@@ -45,7 +45,7 @@ public interface SessionStore {
      */
     record RecentSession(String id, String title, Instant updatedAt) {}
 
-    record MemoryRunGuard(String agentKey, boolean active, boolean pending) {}
+    record ToolRunGuard(String agentKey, boolean active, boolean pending) {}
 
     /** 新一轮的模型材料和对应持久化边界。 */
     record ContextInput(int turn, Message user, Checkpoint checkpoint, List<RunView> history) {}
@@ -72,22 +72,11 @@ public interface SessionStore {
 
     String memoryOwner(String runId);
 
-    MemoryRunGuard lockMemoryRun(String runId);
+    ToolRunGuard lockToolRun(String runId);
 
     Message recordedToolResult(String runId, int assistantSeq, Message.ToolCall call);
 
-    Message memorySource(String runId, int seq);
-
     ContextInput context(String id);
-
-    /** 保存不可变归档，路径由 PostgreSQL 生成并限制在当前会话。 */
-    String saveArchive(String runId, String body);
-
-    /** 导出到指定轮次为止的成功历史和当前轮次，按原始顺序生成摘要前快照。 */
-    List<Message> archiveMessages(String runId, int throughTurn);
-
-    /** 按 Unicode 字符偏移读取归档的一页；越界、跨会话或运行结束时返回 null。 */
-    String archivePage(String runId, String path, int offset, int length);
 
     void finish(String id, Message answer);
 

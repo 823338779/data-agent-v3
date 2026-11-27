@@ -21,16 +21,6 @@
             <artifactId>model</artifactId>
             <version>${project.version}</version>
         </dependency>
-        <dependency>
-            <groupId>com.datagent</groupId>
-            <artifactId>session</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.datagent</groupId>
-            <artifactId>memory</artifactId>
-            <version>${project.version}</version>
-        </dependency>
         <!-- Boot 4 专用 starter 配置 Mapper，业务数据持久化于 PostgreSQL。 -->
         <dependency>
             <groupId>com.baomidou</groupId>

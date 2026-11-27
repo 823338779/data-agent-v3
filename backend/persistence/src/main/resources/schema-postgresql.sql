@@ -2,15 +2,11 @@
 CREATE TABLE IF NOT EXISTS agent_session (
     id varchar(36) PRIMARY KEY,
     agent_key text NOT NULL,
-    active_run_id varchar(36),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    active_run_id varchar(36)
 );
 COMMENT ON COLUMN agent_session.id IS '会话标识';
 COMMENT ON COLUMN agent_session.agent_key IS '会话绑定的 Agent';
 COMMENT ON COLUMN agent_session.active_run_id IS '当前占用会话的运行';
-COMMENT ON COLUMN agent_session.created_at IS '创建时间';
-COMMENT ON COLUMN agent_session.updated_at IS '最近状态更新时间';
 
 -- 运行标识及关联数据。
 CREATE TABLE IF NOT EXISTS agent_run (
@@ -50,14 +46,12 @@ CREATE TABLE IF NOT EXISTS agent_context_checkpoint (
     through_turn integer NOT NULL CHECK (through_turn > 0),
     summary text NOT NULL,
     format_version integer NOT NULL,
-    updated_at timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (session_id, through_turn) REFERENCES agent_run(session_id, turn_no)
 );
 COMMENT ON COLUMN agent_context_checkpoint.session_id IS '所属会话';
 COMMENT ON COLUMN agent_context_checkpoint.through_turn IS '摘要覆盖的最后一个成功轮次';
 COMMENT ON COLUMN agent_context_checkpoint.summary IS '仅供模型参考的会话摘要';
 COMMENT ON COLUMN agent_context_checkpoint.format_version IS '摘要格式版本';
-COMMENT ON COLUMN agent_context_checkpoint.updated_at IS '检查点更新时间';
 
 ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS steer_close_reason text;
 COMMENT ON COLUMN agent_run.steer_close_reason IS '运行中关闭补充入口的原因；终态由 status 派生';
@@ -110,13 +104,80 @@ COMMENT ON COLUMN agent_run_usage.output_tokens IS '已上报调用的实际输�
 COMMENT ON COLUMN agent_run_usage.input_reported_calls IS '已取得实际输入 token 数的模型调用次数';
 COMMENT ON COLUMN agent_run_usage.output_reported_calls IS '已取得实际输出 token 数的模型调用次数';
 
--- 同会话内相同正文只保存一份；引用在会话恢复后继续有效。
-CREATE TABLE IF NOT EXISTS agent_context_archive (
-    session_id varchar(36) NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
-    path text NOT NULL,
-    body text NOT NULL,
-    PRIMARY KEY (session_id, path)
-);
-COMMENT ON COLUMN agent_context_archive.session_id IS '归档所属会话，由活动 Run 推导';
-COMMENT ON COLUMN agent_context_archive.path IS '按正文 SHA-256 生成的 PostgreSQL 归档引用';
-COMMENT ON COLUMN agent_context_archive.body IS '完整工具输出，或摘要前模型可见的原始消息 JSONL';
+-- 所有写入入口共用行级审计。保留创建时间和首次删除时间，恢复时清除删除时间。
+CREATE OR REPLACE FUNCTION agent_stamp_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.update_at := clock_timestamp();
+    IF TG_OP = 'INSERT' THEN
+        NEW.create_at := NEW.update_at;
+    ELSE
+        NEW.create_at := OLD.create_at;
+        NEW.tenent_id := OLD.tenent_id;
+    END IF;
+    IF NOT NEW.is_deleted THEN
+        NEW.delete_at := NULL;
+    ELSIF TG_OP = 'UPDATE' AND OLD.is_deleted THEN
+        NEW.delete_at := OLD.delete_at;
+    ELSE
+        NEW.delete_at := NEW.update_at;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+DECLARE
+    business_table regclass;
+    needs_history boolean;
+    legacy record;
+BEGIN
+    -- 原地改名以保留历史时间及其约束，重复启动时跳过已迁移的列。
+    FOR legacy IN SELECT * FROM (VALUES
+        ('agent_session'::regclass, 'created_at', 'create_at'),
+        ('agent_session'::regclass, 'updated_at', 'update_at'),
+        ('agent_context_checkpoint'::regclass, 'updated_at', 'update_at')
+    ) AS old_column(relation, old_name, new_name) LOOP
+        IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = legacy.relation
+                   AND attname = legacy.old_name AND NOT attisdropped) THEN
+            EXECUTE format('ALTER TABLE %s RENAME COLUMN %I TO %I',
+                           legacy.relation, legacy.old_name, legacy.new_name);
+        END IF;
+    END LOOP;
+
+    FOREACH business_table IN ARRAY ARRAY[
+        'agent_session'::regclass, 'agent_run'::regclass, 'agent_message'::regclass,
+        'agent_context_checkpoint'::regclass, 'agent_run_steer'::regclass,
+        'agent_memory'::regclass, 'agent_run_usage'::regclass
+    ] LOOP
+        SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = business_table
+                           AND attname = 'create_at' AND NOT attisdropped) INTO needs_history;
+        EXECUTE format('ALTER TABLE %s
+            ADD COLUMN IF NOT EXISTS is_deleted boolean NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS create_at timestamptz NOT NULL DEFAULT now(),
+            ADD COLUMN IF NOT EXISTS update_at timestamptz NOT NULL DEFAULT now(),
+            ADD COLUMN IF NOT EXISTS delete_at timestamptz,
+            ADD COLUMN IF NOT EXISTS tenent_id bigint NOT NULL DEFAULT 1', business_table);
+
+        -- 优先采用已记录的业务时间；无原始时间的旧行以迁移时间作为审计起点。
+        IF needs_history THEN
+            CASE business_table
+                WHEN 'agent_run'::regclass THEN
+                    UPDATE agent_run SET create_at = started_at, update_at = coalesce(ended_at, started_at);
+                WHEN 'agent_run_steer'::regclass THEN
+                    UPDATE agent_run_steer SET create_at = received_at, update_at = received_at;
+                WHEN 'agent_context_checkpoint'::regclass THEN
+                    UPDATE agent_context_checkpoint SET create_at = update_at;
+                ELSE NULL;
+            END CASE;
+        END IF;
+
+        EXECUTE format('COMMENT ON COLUMN %s.is_deleted IS %L', business_table, '逻辑删除标记，true 表示该行已标记删除');
+        EXECUTE format('COMMENT ON COLUMN %s.create_at IS %L', business_table, '记录创建时间，旧数据使用最早可追溯时间');
+        EXECUTE format('COMMENT ON COLUMN %s.update_at IS %L', business_table, '记录最近一次写入时间');
+        EXECUTE format('COMMENT ON COLUMN %s.delete_at IS %L', business_table, '本次逻辑删除时间，未删除或已恢复时为空');
+        EXECUTE format('COMMENT ON COLUMN %s.tenent_id IS %L', business_table, '记录所属租户标识，当前单用户部署默认使用 1');
+        EXECUTE format('CREATE OR REPLACE TRIGGER agent_row_audit BEFORE INSERT OR UPDATE ON %s
+                        FOR EACH ROW EXECUTE FUNCTION agent_stamp_audit()', business_table);
+    END LOOP;
+END;
+$$;

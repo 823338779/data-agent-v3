@@ -10,7 +10,7 @@ import lombok.Setter;
 @Getter
 @Setter
 @TableName("agent_memory")
-public class MemoryEntity {
+public class MemoryEntity extends BaseEntity {
     /** 当前记忆所属 Agent 的业务标识。 */
     @TableId(type = IdType.INPUT)
     private String agentKey;

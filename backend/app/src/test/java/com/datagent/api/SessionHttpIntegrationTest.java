@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,7 +28,7 @@ class SessionHttpIntegrationTest extends PostgresTest {
     private final HttpClient http = HttpClient.newHttpClient();
 
     private HttpRequest request(String path, String body) {
-        var builder = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/sessions" + path))
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/sessions" + path))
                 .timeout(Duration.ofSeconds(15)).header("Content-Type", "application/json");
         return (body == null ? builder.GET() : builder.POST(HttpRequest.BodyPublishers.ofString(body))).build();
     }
@@ -35,7 +36,7 @@ class SessionHttpIntegrationTest extends PostgresTest {
         return http.send(request(path, body), HttpResponse.BodyHandlers.ofString());
     }
     private String session() throws Exception {
-        var response = send("", "");
+        HttpResponse<String> response = send("", "");
         assertThat(response.statusCode()).isBetween(200, 201);
         return "/" + json.readTree(response.body()).get("sessionId").asString();
     }
@@ -50,7 +51,7 @@ class SessionHttpIntegrationTest extends PostgresTest {
             call.<Consumer<String>>getArgument(1).accept("OK");
             return new ModelClient.ModelReply("OK", List.of());
         });
-        var result = send(path + "/runs", "{\"message\":\"hello\"}");
+        HttpResponse<String> result = send(path + "/runs", "{\"message\":\"hello\"}");
         assertThat(result.statusCode()).isEqualTo(200);
         assertThat(result.body()).containsSubsequence("event:run.started", "event:text.delta", "event:run.completed");
         assertThat(json.readTree(send(path, null).body()).at("/runs/0/messages/1/content").asString()).isEqualTo("OK");
@@ -60,14 +61,14 @@ class SessionHttpIntegrationTest extends PostgresTest {
     }
 
     @Test void disconnectDoesNotCancelRun() throws Exception {
-        var release = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         when(model.complete(any(), any())).thenAnswer(ignored -> {
             if (!release.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("test timeout");
             return new ModelClient.ModelReply("completed after disconnect", List.of());
         });
         String path = session();
-        try (var body = http.send(request(path + "/runs", "{\"message\":\"wait\"}"), HttpResponse.BodyHandlers.ofInputStream()).body();
-             var reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
+        try (InputStream body = http.send(request(path + "/runs", "{\"message\":\"wait\"}"), HttpResponse.BodyHandlers.ofInputStream()).body();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {
             assertThat(reader.readLine()).isEqualTo("event:run.started");
             assertThat(send(path + "/runs", "{\"message\":\"second\"}").statusCode()).isEqualTo(409);
         } finally {
@@ -86,10 +87,10 @@ class SessionHttpIntegrationTest extends PostgresTest {
     }
 
     @Test void steersAfterFirstDeltaWithoutStartingAnotherRun() throws Exception {
-        var firstDelta = new CountDownLatch(1);
-        var release = new CountDownLatch(1);
+        CountDownLatch firstDelta = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         String path = session();
-        var requestCount = new java.util.concurrent.atomic.AtomicInteger();
+        AtomicInteger requestCount = new java.util.concurrent.atomic.AtomicInteger();
         when(model.complete(any(), any())).thenAnswer(call -> {
             if (requestCount.incrementAndGet() == 1) {
                 call.<Consumer<String>>getArgument(1).accept("UTC 02:00。");
@@ -97,12 +98,12 @@ class SessionHttpIntegrationTest extends PostgresTest {
                 if (!release.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("test timeout");
                 return new ModelClient.ModelReply("UTC 02:00。", List.of());
             }
-            var request = call.<ModelClient.ModelRequest>getArgument(0);
+            ModelClient.ModelRequest request = call.<ModelClient.ModelRequest>getArgument(0);
             assertThat(request.messages()).extracting(Message::content)
                     .containsSubsequence("UTC 02:00。", "[本轮补充] 也给我北京时间");
             return new ModelClient.ModelReply("北京时间 10:00。", List.of());
         });
-        var stream = http.sendAsync(request(path + "/runs", "{\"message\":\"现在 UTC 几点？\"}"),
+        CompletableFuture<HttpResponse<String>> stream = http.sendAsync(request(path + "/runs", "{\"message\":\"现在 UTC 几点？\"}"),
                 HttpResponse.BodyHandlers.ofString());
         String steerPath;
         String supplement = json.writeValueAsString(Map.of("clientMessageId", UUID.randomUUID().toString(),
@@ -111,7 +112,7 @@ class SessionHttpIntegrationTest extends PostgresTest {
             assertThat(firstDelta.await(5, TimeUnit.SECONDS)).isTrue();
             String id = json.readTree(send(path, null).body()).get("activeRunId").asString();
             steerPath = path + "/runs/" + id + "/steers";
-            var accepted = send(steerPath, supplement);
+            HttpResponse<String> accepted = send(steerPath, supplement);
             assertThat(accepted.statusCode()).isEqualTo(202);
             assertThat(json.readTree(accepted.body()).get("messageSeq").isNull()).isTrue();
             assertThat(send(steerPath, supplement).statusCode()).isEqualTo(200);
@@ -119,17 +120,17 @@ class SessionHttpIntegrationTest extends PostgresTest {
         } finally {
             release.countDown();
         }
-        var response = stream.get(10, TimeUnit.SECONDS);
+        HttpResponse<String> response = stream.get(10, TimeUnit.SECONDS);
         assertThat(response.body()).containsSubsequence("event:text.delta", "event:run.reply_committed",
                 "event:run.steer_incorporated", "event:run.completed");
         assertThat(response.body().split("event:run.completed", -1)).hasSize(2);
-        var snapshot = json.readTree(send(path, null).body()).get("runs");
+        JsonNode snapshot = json.readTree(send(path, null).body()).get("runs");
         assertThat(snapshot.size()).isEqualTo(1);
         assertThat(snapshot.at("/0/messages/1/content").asString()).isEqualTo("UTC 02:00。");
         assertThat(snapshot.at("/0/messages/2/content").asString()).isEqualTo("也给我北京时间");
         assertThat(snapshot.at("/0/messages/3/content").asString()).isEqualTo("北京时间 10:00。");
         assertThat(snapshot.at("/0/steers/0/messageSeq").asInt()).isEqualTo(2);
-        var receipt = send(steerPath, supplement);
+        HttpResponse<String> receipt = send(steerPath, supplement);
         assertThat(receipt.statusCode()).isEqualTo(200);
         assertThat(json.readTree(receipt.body()).get("runStatus").asString()).isEqualTo("SUCCEEDED");
         assertThat(send(steerPath, json.writeValueAsString(Map.of("clientMessageId", UUID.randomUUID().toString(),
@@ -146,9 +147,9 @@ class SessionHttpIntegrationTest extends PostgresTest {
         send(first + "/runs", "{\"message\":\"继续追问\"}");
 
         // 列表只呈现有消息的会话；追问改变顺序，标题仍取首条提问。
-        var response = send("", null);
+        HttpResponse<String> response = send("", null);
         assertThat(response.statusCode()).isEqualTo(200);
-        var rows = json.readTree(response.body());
+        JsonNode rows = json.readTree(response.body());
         assertThat(rows.at("/0/id").asString()).isEqualTo(first.substring(1));
         assertThat(rows.at("/0/title").asString()).isEqualTo("第一条提问");
         assertThat(rows.at("/0/updatedAt").asString()).isNotBlank();

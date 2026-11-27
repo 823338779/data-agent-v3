@@ -1,6 +1,7 @@
 package com.datagent.persistence.service;
 
-import com.datagent.memory.MemoryRepository;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.datagent.persistence.MemoryRepository;
 import com.datagent.persistence.entity.MemoryEntity;
 import com.datagent.persistence.mapper.MemoryMapper;
 import lombok.RequiredArgsConstructor;
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Repository;
 @Repository
 @RequiredArgsConstructor
 class PostgresMemoryRepository implements MemoryRepository {
+    private static final String FOR_UPDATE = "FOR UPDATE";
     /** 未写入记忆的 Agent 从空正文和版本零开始。 */
     private static final Snapshot EMPTY = new Snapshot("", 0);
     /** 记忆的普通读取、锁定和按版本写入。 */
@@ -19,7 +21,11 @@ class PostgresMemoryRepository implements MemoryRepository {
     public Snapshot read(String key) { return snapshot(mapper.selectById(key)); }
 
     @Override
-    public Snapshot locked(String key) { return snapshot(mapper.locked(key)); }
+    public Snapshot locked(String key) {
+        // 使用实体映射获取行锁，与普通读取采用同一逻辑删除条件。
+        return snapshot(mapper.selectOne(Wrappers.<MemoryEntity>lambdaQuery()
+                .eq(MemoryEntity::getAgentKey, key).last(FOR_UPDATE)));
+    }
 
     private static Snapshot snapshot(MemoryEntity row) {
         return row == null ? EMPTY : new Snapshot(row.getContent(), row.getRevision());

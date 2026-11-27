@@ -8,9 +8,13 @@ import org.apache.ibatis.annotations.*;
 /** agent_run 的 MyBatis-Plus 映射。 */
 @Mapper
 public interface RunMapper extends BaseMapper<RunEntity> {
+    // 删除的轮次仍占用原序号，避免与保留的唯一键冲突。
+    @Select("SELECT coalesce(max(turn_no), 0) + 1 FROM agent_run WHERE session_id = #{sessionId}")
+    int nextTurn(String sessionId);
+
     String INIT_USAGE = "INSERT INTO agent_run_usage(run_id) VALUES (#{runId})";
-    String COUNT_BUSINESS = "UPDATE agent_run_usage SET business_calls = business_calls + 1 WHERE run_id = #{runId}";
-    String COUNT_SUMMARY = "UPDATE agent_run_usage SET summary_calls = summary_calls + 1 WHERE run_id = #{runId}";
+    String COUNT_BUSINESS = "UPDATE agent_run_usage SET business_calls = business_calls + 1 WHERE run_id = #{runId} AND NOT is_deleted";
+    String COUNT_SUMMARY = "UPDATE agent_run_usage SET summary_calls = summary_calls + 1 WHERE run_id = #{runId} AND NOT is_deleted";
     String ADD_TOKENS = """
             <script>
             UPDATE agent_run_usage
@@ -22,7 +26,7 @@ public interface RunMapper extends BaseMapper<RunEntity> {
                     output_tokens = COALESCE(output_tokens, 0) + #{output}, output_reported_calls = output_reported_calls + 1,
                 </if>
             </set>
-            WHERE run_id = #{runId}
+            WHERE run_id = #{runId} AND NOT is_deleted
             </script>
             """;
 

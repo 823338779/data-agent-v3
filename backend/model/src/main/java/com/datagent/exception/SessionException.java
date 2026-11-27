@@ -1,4 +1,4 @@
-package com.datagent.session;
+package com.datagent.exception;
 
 /** 会话操作失败的业务原因，供调用方决定如何反馈。 */
 public final class SessionException extends RuntimeException {

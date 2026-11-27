@@ -1,5 +1,6 @@
 package com.datagent.memory;
 
+import com.datagent.persistence.MemoryRepository;
 import static org.assertj.core.api.Assertions.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -16,11 +17,11 @@ class MemoryRepositoryIntegrationTest extends PostgresTest {
     @Autowired JdbcTemplate jdbc;
 
     @Test void oneTextRowAndByteLimitAcrossFullReplacement() {
-        var key = UUID.randomUUID().toString();
+        String key = UUID.randomUUID().toString();
         try {
             assertThat(repository.read(key)).isEqualTo(new MemoryRepository.Snapshot("", 0));
             assertThat(jdbc.queryForObject("SELECT count(*) FROM agent_memory WHERE agent_key = ?", Integer.class, key)).isZero();
-            var text = "字".repeat(666) + "\n\"";
+            String text = "字".repeat(666) + "\n\"";
             assertThat(repository.update(key, 0, text)).isTrue();
             assertThat(jdbc.queryForObject("SELECT pg_typeof(content)::text FROM agent_memory WHERE agent_key = ?", String.class, key))
                     .isEqualTo("text");
@@ -37,12 +38,12 @@ class MemoryRepositoryIntegrationTest extends PostgresTest {
     }
 
     @Test void onlyOneWriterCanUseTheSameRevision() throws Exception {
-        var key = UUID.randomUUID().toString();
-        try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+        String key = UUID.randomUUID().toString();
+        try (ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor()) {
             for (long revision : List.of(0L, 1L)) {
-                var gate = new CyclicBarrier(2);
-                var first = workers.submit(() -> { gate.await(5, TimeUnit.SECONDS); return repository.update(key, revision, "甲"); });
-                var second = workers.submit(() -> { gate.await(5, TimeUnit.SECONDS); return repository.update(key, revision, "乙"); });
+                CyclicBarrier gate = new CyclicBarrier(2);
+                Future<Boolean> first = workers.submit(() -> { gate.await(5, TimeUnit.SECONDS); return repository.update(key, revision, "甲"); });
+                Future<Boolean> second = workers.submit(() -> { gate.await(5, TimeUnit.SECONDS); return repository.update(key, revision, "乙"); });
                 assertThat(List.of(first.get(5, TimeUnit.SECONDS), second.get(5, TimeUnit.SECONDS))).containsExactlyInAnyOrder(true, false);
                 assertThat(repository.read(key).revision()).isEqualTo(revision + 1);
                 assertThat(repository.read(key).content()).isIn("甲", "乙");

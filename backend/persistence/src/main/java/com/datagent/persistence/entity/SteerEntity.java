@@ -9,7 +9,7 @@ import lombok.Setter;
 @Getter
 @Setter
 @TableName("agent_run_steer")
-public class SteerEntity {
+public class SteerEntity extends BaseEntity {
     /** 目标 Run 行锁内分配的收件顺序。 */
     @TableId(type = IdType.AUTO)
     private Long id;

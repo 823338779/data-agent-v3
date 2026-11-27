@@ -1,127 +1,163 @@
 package com.datagent.model;
 
-import static com.datagent.model.ChatCompletionsClient.*;
+import static com.datagent.model.ResponsesClient.*;
+import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
-/** 单次请求的 SSE 解析状态，按 index 聚合交错的工具分片。 */
+/** 按 SSE 空行分帧，实时交付正文，完整工具调用以终止事件中的 output 为准。 */
 final class CompletionStream implements Flow.Subscriber<String> {
-    private static final String DATA = "data:", DONE = "[DONE]", CHOICES = "choices", INDEX = "index";
-    private static final String DELTA = "delta", REASON = "finish_reason", ERROR = "error";
-    private static final String USAGE = "usage", INPUT = "prompt_tokens", OUTPUT = "completion_tokens";
-    /** 最近一次有效的累计输入和输出读数，缺失时保留未知。 */
-    private volatile Long inputTokens, outputTokens;
+    private static final String DATA = "data:", DONE = "[DONE]", DELTA = "delta", RESPONSE = "response";
+    private static final String TEXT_DELTA = "response.output_text.delta", REFUSAL_DELTA = "response.refusal.delta";
+    private static final String COMPLETED = "response.completed", FAILED = "response.failed", INCOMPLETE = "response.incomplete";
+    private static final String ERROR = "error", STATUS = "status", SUCCESS = "completed", DETAILS = "incomplete_details";
+    private static final String REASON = "reason", CODE = "code", TEXT = "text", OUTPUT_TEXT = "output_text", REFUSAL = "refusal";
+    private static final String USAGE = "usage", INPUT_TOKENS = "input_tokens", OUTPUT_TOKENS = "output_tokens";
+    /** 单次交换的协议解码、可见文本回调和请求的输出预算。 */
     private final ObjectMapper json;
-    /** 对前端可见的文本增量回调。 */
     private final Consumer<String> onText;
-    /** 当前 SSE 帧可能包含多行 data。 */
+    private final int maxOutputTokens;
+    /** 当前事件的 data 行，空行才提交事件。 */
     private final StringBuilder frame = new StringBuilder();
-    /** 本次请求的累计回答。 */
-    private final StringBuilder text = new StringBuilder();
-    /** 工具编排按模型给出的调用位置排序。 */
-    private final SortedMap<Integer, CallParts> calls = new TreeMap<>();
-    /** 模型结束原因及传输结束标记。 */
-    private String reason;
-    private boolean done;
+    /** 已收到的终止事件类型及快照，其中含实际用量、完整输出项和调用参数。 */
+    private String terminalType;
+    private JsonNode response;
+    /** 调用方取消或完成后忽略迟到的分片。 */
+    private boolean closed;
 
-    private static class CallParts {
-        String id;
-        final StringBuilder name = new StringBuilder();
-        final StringBuilder args = new StringBuilder();
-    }
-
-    CompletionStream(ObjectMapper json, Consumer<String> onText) {
+    CompletionStream(ObjectMapper json, Consumer<String> onText, int maxOutputTokens) {
         this.json = json;
         this.onText = onText;
+        this.maxOutputTokens = maxOutputTokens;
+    }
+
+    /** 首批字节只解除启动超时；响应完成仍由 JDK 的行订阅器按 HTTP 消息边界判定。 */
+    HttpResponse.BodySubscriber<Void> bodySubscriber(CompletableFuture<Void> started) {
+        HttpResponse.BodySubscriber<Void> lines = HttpResponse.BodySubscribers.fromLineSubscriber(
+                this, ignored -> null, StandardCharsets.UTF_8, null);
+        return new HttpResponse.BodySubscriber<>() {
+            @Override public CompletionStage<Void> getBody() { return lines.getBody(); }
+            @Override public void onSubscribe(Flow.Subscription subscription) { lines.onSubscribe(subscription); }
+            @Override public void onNext(List<ByteBuffer> buffers) {
+                if (!started.isDone() && buffers.stream().anyMatch(ByteBuffer::hasRemaining)) started.complete(null);
+                lines.onNext(buffers);
+            }
+            @Override public void onError(Throwable error) { lines.onError(error); }
+            @Override public void onComplete() { lines.onComplete(); }
+        };
     }
 
     public void onSubscribe(Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
-    public void onError(Throwable error) { /* HTTP Future 将错误交回调用方。 */ }
-    public void onComplete() { flush(); }
+    public void onError(Throwable error) { /* HTTP Future 负责交付传输异常。 */ }
+    public void onComplete() { /* EOF 不提交残帧，reply 会验证已收到终止事件。 */ }
 
-    public void onNext(String line) {
+    public synchronized void onNext(String line) {
+        if (closed) return;
         if (line.isEmpty()) {
-            flush();
+            if (!frame.isEmpty()) {
+                String data = frame.toString();
+                frame.setLength(0);
+                accept(data);
+            }
         } else if (line.startsWith(DATA)) {
             if (!frame.isEmpty()) frame.append('\n');
-            frame.append(line.substring(DATA.length()).stripLeading());
+            int start = DATA.length();
+            if (start < line.length() && line.charAt(start) == ' ') start++;
+            frame.append(line, start, line.length());
         }
     }
 
-    private void flush() {
-        if (frame.isEmpty()) return;
-        String data = frame.toString();
-        frame.setLength(0);
-        if (DONE.equals(data)) {
-            done = true;
-            return;
-        }
-        var chunk = json.readTree(data);
-        if (done || chunk.has(ERROR)) throw new IllegalStateException("模型流包含异常事件");
-        // usage 可能随普通分片返回，也可能独占 choices 为空的尾帧；累计值不逐帧相加。
-        var usage = chunk.path(USAGE);
-        if (usage.isObject()) {
-            var input = usage.path(INPUT);
-            var output = usage.path(OUTPUT);
-            if (validCount(input)) inputTokens = input.asLong();
-            if (validCount(output)) outputTokens = output.asLong();
-        }
-        var choices = chunk.path(CHOICES);
-        if (choices.isEmpty()) return;
-        // 默认请求一个候选；usage 尾帧允许没有候选。
-        var choice = choices.get(0);
-        var delta = choice.path(DELTA);
-        var content = delta.path(CONTENT);
-        if (content.isString() && !content.asString().isEmpty()) {
-            text.append(content.asString());
-            onText.accept(content.asString());
-        }
-        for (var call : delta.path(CALLS)) addCall(call);
-        if (choice.path(REASON).isString()) reason = choice.get(REASON).asString();
-    }
-
-    private static boolean validCount(JsonNode value) {
-        return value.isIntegralNumber() && value.canConvertToLong() && value.asLong() >= 0;
-    }
-
-    void reportUsage(BiConsumer<Long, Long> listener) {
-        if (listener != null && (inputTokens != null || outputTokens != null)) {
-            listener.accept(inputTokens, outputTokens);
+    private void accept(String data) {
+        // 个别端点会另发传输尾标记，业务结果仍需核实 Responses 终止事件。
+        if (DONE.equals(data)) return;
+        if (terminalType != null) throw new IllegalStateException("模型终止事件后仍返回数据");
+        JsonNode event = json.readTree(data);
+        String type = event.path(TYPE).asString("");
+        switch (type) {
+            case TEXT_DELTA, REFUSAL_DELTA -> {
+                String text = event.path(DELTA).asString("");
+                if (!text.isEmpty()) onText.accept(text);
+            }
+            case COMPLETED, INCOMPLETE, FAILED, ERROR -> {
+                terminalType = type;
+                response = ERROR.equals(type) ? event : event.path(RESPONSE);
+            }
+            default -> { /* 推理和函数参数仅从终止快照读取，增量不进入可见正文。 */ }
         }
     }
 
-    private void addCall(JsonNode delta) {
-        int index = delta.path(INDEX).asInt(-1);
-        if (index < 0) throw new IllegalStateException("工具调用缺少位置");
-        var parts = calls.computeIfAbsent(index, ignored -> new CallParts());
-        if (delta.path(ID).isString() && !delta.get(ID).asString().isBlank()) {
-            if (parts.id != null && !parts.id.equals(delta.get(ID).asString())) throw new IllegalStateException("调用 ID 冲突");
-            parts.id = delta.get(ID).asString();
-        }
-        var function = delta.path(FUNCTION);
-        if (function.path(NAME).isString()) parts.name.append(function.get(NAME).asString());
-        if (function.path(ARGUMENTS).isString()) parts.args.append(function.get(ARGUMENTS).asString());
+    private Long tokens(String field) {
+        if (response == null) return null;
+        JsonNode count = response.path(USAGE).path(field);
+        return count.isIntegralNumber() && count.canConvertToLong() && count.asLong() >= 0 ? count.asLong() : null;
+    }
+
+    synchronized void close(BiConsumer<Long, Long> listener) {
+        closed = true;
+        Long input = tokens(INPUT_TOKENS), output = tokens(OUTPUT_TOKENS);
+        if (listener != null && (input != null || output != null)) listener.accept(input, output);
     }
 
     ModelClient.ModelReply reply() {
-        // 完整终止帧和有效调用 ID 缺一不可，禁止执行半条调用。
-        String expected = calls.isEmpty() ? STOP : CALLS;
-        if (!done || !expected.equals(reason)) {
-            throw new IllegalStateException("模型回复中断或被截断");
+        // 先确认响应状态，断流、生成失败和输出不足均不能触发工具。
+        if (terminalType == null) throw new ModelClient.InterruptedResponse("模型响应流提前结束，缺少 Responses 终止事件", null);
+        if (FAILED.equals(terminalType) || ERROR.equals(terminalType)) {
+            JsonNode error = ERROR.equals(terminalType) ? response : response.path(ERROR);
+            throw new IllegalStateException("模型服务生成失败，错误码：" + error.path(CODE).asString(""));
         }
-        var complete = new ArrayList<Message.ToolCall>();
-        var ids = new HashSet<String>();
-        for (var call : calls.values()) {
-            if (call.id == null || call.id.isBlank() || !ids.add(call.id) || call.name.isEmpty() || call.args.isEmpty()) {
-                throw new IllegalStateException("工具调用信息不完整");
+        if (INCOMPLETE.equals(terminalType)) {
+            String reason = response.path(DETAILS).path(REASON).asString("");
+            if (MAX_OUTPUT_TOKENS.equals(reason)) throw new IllegalStateException("模型达到输出上限，回复被截断");
+            throw new IllegalStateException("模型回复未完成，原因：" + reason);
+        }
+        if (!SUCCESS.equals(response.path(STATUS).asString("")) || !response.path(OUTPUT).isArray()) {
+            throw new IllegalStateException("模型终止事件缺少完整的响应快照");
+        }
+        // Ollama 0.32.1 在耗尽预算时仍发 completed，无法区分恰好用满和截断，按截断处理。
+        Long used = tokens(OUTPUT_TOKENS);
+        if (maxOutputTokens > 0 && used != null && used >= maxOutputTokens) {
+            throw new IllegalStateException("模型达到输出上限，回复可能被截断");
+        }
+
+        StringBuilder text = new StringBuilder();
+        List<Message.ToolCall> calls = new ArrayList<>();
+        List<JsonNode> reasoning = new ArrayList<>();
+        Set<String> callIds = new HashSet<>();
+        for (JsonNode item : response.path(OUTPUT)) {
+            switch (item.path(TYPE).asString("")) {
+                case MESSAGE -> {
+                    for (JsonNode part : item.path(CONTENT)) {
+                        switch (part.path(TYPE).asString("")) {
+                            case OUTPUT_TEXT -> text.append(part.path(TEXT).asString(""));
+                            case REFUSAL -> text.append(part.path(REFUSAL).asString(""));
+                        }
+                    }
+                }
+                case FUNCTION_CALL -> {
+                    // call_id 关联工具回执；id 属于输出项，两者用途不同。
+                    String id = item.path(CALL_ID).asString(""), name = item.path(NAME).asString("");
+                    String arguments = item.path(ARGUMENTS).asString("");
+                    if (id.isBlank() || !callIds.add(id) || name.isBlank() || arguments.isBlank()
+                            || !SUCCESS.equals(item.path(STATUS).asString(SUCCESS))) {
+                        throw new IllegalStateException("模型工具调用不完整或调用 ID 重复");
+                    }
+                    if (!json.readTree(arguments).isObject()) throw new IllegalStateException("模型工具参数必须是 JSON 对象");
+                    calls.add(new Message.ToolCall(id, name, arguments));
+                }
+                case REASONING -> reasoning.add(item);
             }
-            json.readTree(call.args.toString());
-            complete.add(new Message.ToolCall(call.id, call.name.toString(), call.args.toString()));
         }
-        return new ModelClient.ModelReply(text.toString(), complete);
+        if (calls.isEmpty() && text.toString().isBlank()) {
+            throw new ModelClient.EmptyResponse(reasoning.isEmpty() ? "模型正常结束但没有回答" : "模型正常结束但仅返回推理");
+        }
+        return new ModelClient.ModelReply(text.toString(), List.copyOf(calls), calls.isEmpty() ? List.of() : List.copyOf(reasoning));
     }
 }

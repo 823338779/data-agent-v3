@@ -10,7 +10,7 @@ import lombok.Setter;
 @Getter
 @Setter
 @TableName(value = "agent_message", autoResultMap = true)
-public class MessageEntity {
+public class MessageEntity extends BaseEntity {
     /** 消息代理主键。 */
     @TableId(type = IdType.AUTO)
     private Long id;

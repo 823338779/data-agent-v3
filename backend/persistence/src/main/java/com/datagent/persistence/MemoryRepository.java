@@ -1,4 +1,4 @@
-package com.datagent.memory;
+package com.datagent.persistence;
 
 import java.nio.charset.StandardCharsets;
 
@@ -7,7 +7,7 @@ public interface MemoryRepository {
     int LIMIT = 2000;
 
     record Snapshot(String content, long revision) {
-        int remaining() { return LIMIT - bytes(content); }
+        public int remaining() { return LIMIT - bytes(content); }
     }
 
     Snapshot read(String key);

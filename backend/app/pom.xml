@@ -25,7 +25,7 @@
         </dependency>
         <dependency>
             <groupId>com.datagent</groupId>
-            <artifactId>session</artifactId>
+            <artifactId>model</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>

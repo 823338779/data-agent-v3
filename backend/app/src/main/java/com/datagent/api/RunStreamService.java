@@ -1,7 +1,7 @@
 package com.datagent.api;
 
 import com.datagent.agent.*;
-import com.datagent.session.SessionStore;
+import com.datagent.persistence.SessionStore;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.util.Optional;
@@ -21,7 +21,7 @@ public class RunStreamService {
     private final SessionStore sessions;
 
     public SseEmitter start(String runId) {
-        var connection = new Connection();
+        Connection connection = new Connection();
         try {
             workers.execute(connection::drain);
             workers.execute(() -> {
@@ -76,9 +76,9 @@ public class RunStreamService {
         void drain() {
             try {
                 while (true) {
-                    var next = queue.take();
+                    Optional<RunEvent> next = queue.take();
                     if (next.isEmpty()) break;
-                    var event = next.get();
+                    RunEvent event = next.get();
                     emitter.send(SseEmitter.event().name(event.type()).id(Long.toString(event.seq())).data(event));
                     if (event.terminal()) break;
                 }

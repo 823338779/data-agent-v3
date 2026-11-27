@@ -19,12 +19,12 @@
         </dependency>
         <dependency>
             <groupId>com.datagent</groupId>
-            <artifactId>tool</artifactId>
+            <artifactId>persistence</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>com.datagent</groupId>
-            <artifactId>session</artifactId>
+            <artifactId>tool</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
@@ -35,6 +35,10 @@
         <dependency>
             <groupId>org.springframework</groupId>
             <artifactId>spring-context</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-tx</artifactId>
         </dependency>
         <dependency>
             <groupId>tools.jackson.core</groupId>

@@ -9,7 +9,7 @@ import lombok.Setter;
 @Getter
 @Setter
 @TableName(value = "agent_run")
-public class RunEntity {
+public class RunEntity extends BaseEntity {
     /** 运行 UUID。 */
     @TableId(type = IdType.INPUT)
     private String id;

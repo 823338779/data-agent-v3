@@ -1,8 +1,8 @@
 package com.datagent.api;
 
 import com.datagent.agent.AgentDefinition;
-import com.datagent.session.SessionException;
-import com.datagent.session.SessionStore;
+import com.datagent.exception.SessionException;
+import com.datagent.persistence.SessionStore;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.util.List;
@@ -34,7 +34,7 @@ public class SessionController {
     /** 将会话操作的业务原因转换为对外的 HTTP 错误响应。 */
     @ExceptionHandler(SessionException.class)
     void sessionError(SessionException error, HttpServletResponse response) throws IOException {
-        var status = switch (error.reason()) {
+        HttpStatus status = switch (error.reason()) {
             case ACTIVE_RUN -> HttpStatus.CONFLICT;
             case INVALID_STEER -> HttpStatus.BAD_REQUEST;
             case NOT_FOUND -> HttpStatus.NOT_FOUND;
@@ -65,7 +65,7 @@ public class SessionController {
     @PostMapping(STEERS)
     public ResponseEntity<?> steer(@PathVariable UUID sessionId, @PathVariable UUID runId, @RequestBody SteerInput input) {
         try {
-            var result = sessions.acceptSteer(sessionId.toString(), runId.toString(), input.clientMessageId(), input.message());
+            SessionStore.SteerAcceptance result = sessions.acceptSteer(sessionId.toString(), runId.toString(), input.clientMessageId(), input.message());
             return ResponseEntity.status(result.created() ? HttpStatus.ACCEPTED : HttpStatus.OK).body(result.receipt());
         } catch (SessionStore.SteerRejected rejected) {
             int status = SessionStore.STEER_LIMIT.equals(rejected.getCode()) ? 422 : 409;
